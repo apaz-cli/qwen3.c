@@ -1,20 +1,3 @@
-"""
-This script has functions and utilties for model export.
-Basically, we have a bunch of versions of the model, and we
-want to export them to .bin files to be read from and inferenced in C.
-
-Among the "input" versions of PyTorch files/models:
-- Official Llama 2 weights released by Meta
-- Huggingface weights available on the hub
-- llama2.c (this repo) trained models
-
-Among the "output" versions of .bin files:
-- v0: Legacy files of the original llama2.c repo (will eventually be DEPRECATED)
-- v1-vN: Improved .bin files with a proper header, cache alignment, etc.
-
-This script aspires to provide all of these conversions.
-"""
-
 import argparse
 import gzip
 import json
