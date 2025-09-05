@@ -4,6 +4,12 @@ pprint() {
     printf "\033[35m$1\033[0m\n"
 }
 
+if [ "$1" = "clean" ]; then
+    rm -rf /tmp/Qwen3-0.6B/ Qwen3-0.6B.bin* qwen3
+    pprint "Cleaned up files."
+    exit 0
+fi
+
 if [ ! -d ".venv" ]; then
     python3 -m venv .venv
 fi
@@ -26,5 +32,3 @@ fi
 
 pprint "Compiling qwen3.c to ./qwen3..."
 cc -Ofast -fopenmp -march=native qwen3.c -lm -o qwen3
-
-# Clean: rm -rf /tmp/Qwen3-0.6B/ Qwen3-0.6B.bin* qwen3
