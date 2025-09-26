@@ -1,0 +1,19 @@
+Traceback (most recent call last):
+  File "/home/apaz/git/qwen3.c/export.py", line 385, in <module>
+    model = load_hf_model(args.hfpath)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/apaz/git/qwen3.c/export.py", line 294, in load_hf_model
+    hf_model = AutoModelForCausalLM.from_pretrained(model_path)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/apaz/git/qwen3.c/.venv/lib/python3.11/site-packages/transformers/models/auto/auto_factory.py", line 604, in from_pretrained
+    return model_class.from_pretrained(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/apaz/git/qwen3.c/.venv/lib/python3.11/site-packages/transformers/modeling_utils.py", line 288, in _wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/apaz/git/qwen3.c/.venv/lib/python3.11/site-packages/transformers/modeling_utils.py", line 5060, in from_pretrained
+    with safe_open(checkpoint_files[0], framework="pt") as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+safetensors_rust.SafetensorError: Error while deserializing header: header too large
+
+The solution is to install git lfs, remove /tmp/Qwen*, and re-run ./build.sh.

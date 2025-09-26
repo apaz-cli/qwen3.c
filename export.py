@@ -21,7 +21,6 @@ from jinja2 import Template
 
 
 def serialize_fp32(file, tensor):
-    """writes one fp32 tensor to file that is open in wb mode"""
     d = tensor.detach().cpu().view(-1).to(torch.float32).numpy()
     b = struct.pack(f"{len(d)}f", *d)
     file.write(b)
@@ -40,25 +39,23 @@ def quantize_q80(w, group_size):
     i.e. symmetric quantization into int8, range [-127,127]
     """
     assert w.numel() % group_size == 0
-    ori_shape = w.shape
-    w = w.float()  # convert to float32
-    w = w.reshape(-1, group_size)
-    # find the max in each group
+    assert w.shape[-1] % group_size == 0
+
+    # convert to float32 and flatten to group size
+    w = w.float().reshape(-1, group_size)
+
+    # Calculate scaling factor and scale to range [-127, 127]
     wmax = torch.abs(w).max(dim=1).values
-    # calculate the scaling factor such that float = quant * scale
-    scale = wmax / 127.0
-    # scale into range [-127, 127]
-    quant = w / scale[:, None]
-    # round to nearest integer
+    scaling_factor = wmax / 127.0
+    quant = w / scaling_factor[:, None]
     int8val = torch.round(quant).to(torch.int8)
-    # dequantize by rescaling
-    fp32val = (int8val.float() * scale[:, None]).view(-1)
+
+    # Dequantize so we can check for error
+    fp32val = (int8val.float() * scaling_factor[:, None]).view(-1)
     fp32valr = fp32val.reshape(-1, group_size)
-    # calculate the max error in each group
-    err = torch.abs(fp32valr - w).max(dim=1).values
-    # find the max error across all groups
-    maxerr = err.max().item()
-    return int8val, scale, maxerr
+    max_err = torch.abs(fp32valr - w).max(dim=1).values.max().item()
+
+    return int8val, scaling_factor, max_err
 
 
 def model_export(model, filepath, group_size=64):
@@ -88,8 +85,11 @@ def model_export(model, filepath, group_size=64):
     shared_classifier = torch.equal(model.tok_embeddings.weight, model.output.weight)
 
     if not shared_classifier:
+        print("Classifier not shared")
         weights.append(model.output.weight)
-    for w in weights:
+    else:
+        print("Classifier shared")
+    for i, w in enumerate(weights):
         assert (
             w.numel() % group_size == 0
         ), f"weight {i} has numel {w.numel()}, not a multiple of group_size {group_size}"
@@ -97,10 +97,9 @@ def model_export(model, filepath, group_size=64):
     # write
     out_file = open(filepath, "wb")
     # first write out the header. the header will be 256 bytes
-    # 1) write magic, which will be uint32 of "ajc1" in ASCII
-    out_file.write(struct.pack("I", 0x616A6331))
-    # 2) write version, which will be int
-    out_file.write(struct.pack("i", version))
+    # 1) write magic, which will be uint32 of "qwen" in ASCII
+    import codecs
+    out_file.write(struct.pack("I", 0x6E657771))
     # 3) write the params, which will be 7 ints
     p = model.params
     hidden_dim = model.layers[0].feed_forward.w1.weight.shape[0]
@@ -116,7 +115,7 @@ def model_export(model, filepath, group_size=64):
         p.max_seq_len,
         p.head_dim,
         int(shared_classifier),
-        group_size
+        group_size,
     )
     out_file.write(header)
 
@@ -134,9 +133,11 @@ def model_export(model, filepath, group_size=64):
 
     # write out the QK-LayerNorm weights (Qwen3)
     for layer in model.layers:
-        serialize_fp32(out_file, layer.attention.lq.weight if layer.attention.lq.weight is not None else torch.ones(config.head_dim))
+        assert layer.attention.lq.weight is not None
+        serialize_fp32(out_file, layer.attention.lq.weight)
     for layer in model.layers:
-        serialize_fp32(out_file, layer.attention.lk.weight if layer.attention.lk.weight is not None else torch.ones(config.head_dim))
+        assert layer.attention.lk.weight is not None
+        serialize_fp32(out_file, layer.attention.lk.weight)
 
     # now let's write out all the params that we are quantizing to Q8_0
     # note we skip classifier weights, which are shared with the embedding
@@ -159,9 +160,11 @@ def model_export(model, filepath, group_size=64):
 
     # write to binary file
     out_file.close()
-    print(f"Written model checkpoint to {filepath}")
+    print(f"Wrote model checkpoint to {filepath}")
+
 
 ## Tokenizer functions
+
 
 def bytes_to_unicode():
     """Reference GPT-2 byte→Unicode map."""
@@ -177,11 +180,12 @@ def bytes_to_unicode():
             n += 1
     return dict(zip(bs, map(chr, cs)))
 
+
 def internal_to_bytes(U2B, token_str: str) -> bytes:
-    return b''.join(
-        bytes([U2B[ch]]) if ch in U2B else ch.encode('utf-8')
-        for ch in token_str
+    return b"".join(
+        bytes([U2B[ch]]) if ch in U2B else ch.encode("utf-8") for ch in token_str
     )
+
 
 def build_tokenizer(model, file):
     # Build the reverse table once
@@ -207,7 +211,10 @@ def build_tokenizer(model, file):
     merges = tokenizer_data["model"]["merges"]
 
     # Build merge rank table
-    merge_rank = {''.join(tuple(merge if isinstance(merge, list) else merge.split())): i for i, merge in enumerate(merges)}
+    merge_rank = {
+        "".join(tuple(merge if isinstance(merge, list) else merge.split())): i
+        for i, merge in enumerate(merges)
+    }
 
     # Create pseudo-score dictionary
     # Tokens from initial vocab get score 0 (unmerged tokens)
@@ -234,11 +241,12 @@ def build_tokenizer(model, file):
 
         for id, token in enumerate(all_tokens):
             token_bytes = internal_to_bytes(U2B, token)
-            out_f.write(struct.pack("f", pseudo_scores[token])) # merge score
-            out_f.write(struct.pack("<I", len(token_bytes))) # 4 bytes: token length
-            out_f.write(token_bytes)                         # UTF-8 bytes
+            out_f.write(struct.pack("f", pseudo_scores[token]))  # merge score
+            out_f.write(struct.pack("<I", len(token_bytes)))  # 4 bytes: token length
+            out_f.write(token_bytes)  # UTF-8 bytes
 
-    print(f"Written tokenizer model to {file}.tokenizer")
+    print(f"Wrote tokenizer model to {file}.tokenizer")
+
 
 def build_prompts(model, file):
     # Compile the template
@@ -246,32 +254,28 @@ def build_prompts(model, file):
 
     # Render the templates and write out the prompts
 
-    messages = [
-        {"role": "user", "content": "%s"}
-    ]
+    messages = [{"role": "user", "content": "%s"}]
 
     rendered_prompt = template.render(messages=messages, add_generation_prompt=True, enable_thinking=False)
-    with open(file + '.template', 'w', encoding='utf-8', newline='') as f:
+    with open(file + ".template", "w", encoding="utf-8", newline="") as f:
         f.write(rendered_prompt)
 
     rendered_prompt = template.render(messages=messages, add_generation_prompt=True, enable_thinking=True)
-    with open(file + '.template.with-thinking', 'w', encoding='utf-8', newline='') as f:
+    with open(file + ".template.with-thinking", "w", encoding="utf-8", newline="") as f:
         f.write(rendered_prompt)
 
-    messages = [
-        {"role": "system", "content": "%s"},
-        {"role": "user", "content": "%s"}
-    ]
+    messages = [{"role": "system", "content": "%s"}, {"role": "user", "content": "%s"}]
 
     rendered_prompt = template.render(messages=messages, add_generation_prompt=True, enable_thinking=False)
-    with open(file + '.template.with-system', 'w', encoding='utf-8', newline='') as f:
+    with open(file + ".template.with-system", "w", encoding="utf-8", newline="") as f:
         f.write(rendered_prompt)
 
     rendered_prompt = template.render(messages=messages, add_generation_prompt=True, enable_thinking=True)
-    with open(file + '.template.with-system-and-thinking', 'w', encoding='utf-8', newline='') as f:
+    with open(file + ".template.with-system-and-thinking", "w", encoding="utf-8", newline="") as f:
         f.write(rendered_prompt)
 
-    print(f"Written prompt templates to {file}.template.*")
+    print(f"Wrote prompt templates to {file}.template.*")
+
 
 # -----------------------------------------------------------------------------
 # Load / import functions
@@ -293,7 +297,7 @@ def load_hf_model(model_path):
     # convert config to ModelArgs
     config = ModelArgs()
 
-    with open(os.path.join(model_path, 'config.json'), 'r') as f:
+    with open(os.path.join(model_path, "config.json"), "r") as f:
         config_json = json.load(f)
 
     config.dim = config_json["hidden_size"]
@@ -320,37 +324,37 @@ def load_hf_model(model_path):
 
     for layer in model.layers:
         i = layer.layer_id
-        layer.attention_norm.weight = nn.Parameter(
+        layer.attention_norm.weight = nn.Parameter(  # type: ignore
             hf_dict[f"model.layers.{i}.input_layernorm.weight"]
         )
-        layer.attention.wq.weight = nn.Parameter(
+        layer.attention.wq.weight = nn.Parameter(  # type: ignore
             hf_dict[f"model.layers.{i}.self_attn.q_proj.weight"]
         )
-        layer.attention.wk.weight = nn.Parameter(
-            hf_dict[f'model.layers.{i}.self_attn.k_proj.weight']
+        layer.attention.wk.weight = nn.Parameter(  # type: ignore
+            hf_dict[f"model.layers.{i}.self_attn.k_proj.weight"]
         )
-        layer.attention.wv.weight = nn.Parameter(
+        layer.attention.wv.weight = nn.Parameter(  # type: ignore
             hf_dict[f"model.layers.{i}.self_attn.v_proj.weight"]
         )
-        layer.attention.wo.weight = nn.Parameter(
+        layer.attention.wo.weight = nn.Parameter(  # type: ignore
             hf_dict[f"model.layers.{i}.self_attn.o_proj.weight"]
         )
-        layer.attention.lq.weight = nn.Parameter(
+        layer.attention.lq.weight = nn.Parameter(  # type: ignore
             hf_dict[f"model.layers.{i}.self_attn.q_norm.weight"]
         )
-        layer.attention.lk.weight = nn.Parameter(
+        layer.attention.lk.weight = nn.Parameter(  # type: ignore
             hf_dict[f"model.layers.{i}.self_attn.k_norm.weight"]
         )
-        layer.ffn_norm.weight = nn.Parameter(
+        layer.ffn_norm.weight = nn.Parameter(  # type: ignore
             hf_dict[f"model.layers.{i}.post_attention_layernorm.weight"]
         )
-        layer.feed_forward.w1.weight = nn.Parameter(
+        layer.feed_forward.w1.weight = nn.Parameter(  # type: ignore
             hf_dict[f"model.layers.{i}.mlp.gate_proj.weight"]
         )
-        layer.feed_forward.w2.weight = nn.Parameter(
+        layer.feed_forward.w2.weight = nn.Parameter(  # type: ignore
             hf_dict[f"model.layers.{i}.mlp.down_proj.weight"]
         )
-        layer.feed_forward.w3.weight = nn.Parameter(
+        layer.feed_forward.w3.weight = nn.Parameter(  # type: ignore
             hf_dict[f"model.layers.{i}.mlp.up_proj.weight"]
         )
 

@@ -155,8 +155,8 @@ class Attention(nn.Module):
         else:
             # manual implementation
             scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
-            assert hasattr(self, 'mask')
-            scores = scores + self.mask[:, :, :seqlen, :seqlen]   # (bs, n_local_heads, seqlen, cache_len + seqlen)
+            assert hasattr(self, 'mask')  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+            scores = scores + self.mask[:, :, :seqlen, :seqlen] # type: ignore
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
             output = torch.matmul(scores, xv)  # (bs, n_local_heads, seqlen, head_dim)
@@ -171,7 +171,7 @@ class Attention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int, multiple_of: int, dropout: float):
+    def __init__(self, dim: int, hidden_dim: int | None, multiple_of: int, dropout: float):
         super().__init__()
         if hidden_dim is None:
             hidden_dim = 4 * dim
@@ -256,8 +256,10 @@ class Transformer(nn.Module):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         h = self.dropout(h)
-        freqs_cos = self.freqs_cos[:seqlen]
-        freqs_sin = self.freqs_sin[:seqlen]
+        freqs_cos = self.freqs_cos[:seqlen] # type: ignore
+        freqs_sin = self.freqs_sin[:seqlen] # type: ignore
+        assert isinstance(freqs_cos, torch.Tensor)
+        assert isinstance(freqs_sin, torch.Tensor)
 
         for layer in self.layers:
             h = layer(h, freqs_cos, freqs_sin)

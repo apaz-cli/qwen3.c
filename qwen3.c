@@ -4,7 +4,6 @@
 
 #include <stdio.h>      // Basic input/output and file handling
 #include <stdlib.h>     // General utility functions
-#include <ctype.h>      // Character handling
 #include <stdint.h>     // Standard integer type definitions like int8_t (8-bit signed integer), uint16_t (16-bit unsigned integer) etc. - for portability
 #include <time.h>
 #include <math.h>
@@ -18,20 +17,9 @@
     #include <sys/mman.h>   // Both are Unix-like system header files
 #endif
 
-// ----------------------------------------------------------------------------
-// Define a global variable GS
-int GS = 0; // Group size for quantizing weights
 
-// ----------------------------------------------------------------------------
-// Transformer model
-
-// 1. Overall architecture and core components
-// 1.1. Model configuration
-// Core function: Define model hyperparameters such as dimensions, layers, attention heads, etc.
-// Multi-query attention: Implement KV head sharing through n_kv_heads to reduce memory usage
 typedef struct {
     int magic_number;
-    int version; // file format version - prevents incompatibility between old and new versions
     int dim;
     int hidden_dim;
     int n_layers;
@@ -40,53 +28,43 @@ typedef struct {
     int vocab_size;
     int seq_len;
     int head_dim;
-    int shared_classifier; // 1 if wcls == p_tokens - whether to share classifier weights (affects parameter reuse and output computation)
-    int group_size; // quantization group size (export.py uses 64) - balances precision and storage
+    int shared_classifier; // For Qwen3-0.6B - 4B, the classifier is shared like in GPT2. For 14B - 32B, it is not.
+    int qgroup_size; // quantization group size (export.py uses 64) - balances precision and storage
 } Config;
 
-// 1.2. Quantized tensors and weight structures
-// 1.2.1. Quantized tensor
-// Quantization design: Use int8 to store weights, recover precision through group scaling factors s (dequantization operation)
-// Memory optimization: Quantization compresses weight storage from float32 (4 bytes) to int8 (1 byte), reducing memory usage by 75%
 typedef struct {
-    int8_t *q;    // quantized values - stores quantized values in int8, dramatically compressing storage
-    float *s; // scaling factors - scaling factors, restore using q[i] * s[group_index] during recovery
-} QuantizedTensor;
+    int8_t *q; // quantized valuess
+    float *s;  // scaling factors
+} Int8Tensor;
 
-// 1.2.2. Model weights
 typedef struct {
     // token embedding table - model's basic mapping for input tokens
-    QuantizedTensor *q_tokens; // (vocab_size, dim) - token embedding table (quantized)
+    Int8Tensor *q_embedding_table; // (vocab_size, dim) - token embedding table (quantized)
     float *token_embedding_table; // same, but dequantized - token embedding table (dequantized)
 
-    // weights for rmsnorms - RMSNorm weights, ensure consistent normalization during training and inference, stabilize numerical computation
-    float *rms_att_weight; // (layer, dim) rmsnorm weights - attention layer RMSNorm weights
-    float *rms_ffn_weight; // (layer, dim) - FFN layer RMSNorm weights
+    // RMSNorm weights
+    float *rms_att_weight; // (layer, dim)
+    float *rms_ffn_weight; // (layer, dim)
+    float *rms_final_weight; // (dim,)
 
-    // weights for matmuls. note dim == n_heads * head_size - attention weight matrices (QKV and output matrices) under multi-query attention q, k, v head counts can differ
-    QuantizedTensor *wq; // (layer, dim, n_heads * head_size)
-    QuantizedTensor *wk; // (layer, dim, n_kv_heads * head_size)
-    QuantizedTensor *wv; // (layer, dim, n_kv_heads * head_size)
-    QuantizedTensor *wo; // (layer, n_heads * head_size, dim)
+    // Weights for attention matmuls.
+    // Note dim == n_heads * head_size - attention weight matrices (QKV and output matrices) under multi-query attention q, k, v head counts can differ
+    Int8Tensor *wq; // (layer, dim, n_heads * head_size)
+    Int8Tensor *wk; // (layer, dim, n_kv_heads * head_size)
+    Int8Tensor *wv; // (layer, dim, n_kv_heads * head_size)
+    Int8Tensor *wo; // (layer, n_heads * head_size, dim)
 
-    // QK-RMSNorm for Qwen3 - Qwen3-specific QK-RMSNorm weights
+    // Qwen-specific QK-RMSNorm weights
     float *q_ln_weights;
     float *k_ln_weights;
 
     // weights for ffn - FFN weight matrices, key support for SwiGLU structure
-    QuantizedTensor *w1; // (layer, hidden_dim, dim)
-    QuantizedTensor *w2; // (layer, dim, hidden_dim)
-    QuantizedTensor *w3; // (layer, hidden_dim, dim)
-    // FFN: Feedforward Neural Network
-    // Unidirectional data flow - Information flows unidirectionally from input layer to output layer, may contain multiple hidden layers, no feedback connections (differs from Recurrent Neural Networks RNN)
-    // Inter-layer full connection - In typical FFN structure, each layer's neurons connect to all neurons in the next layer, called Fully Connected Layer
+    Int8Tensor *w1; // (layer, hidden_dim, dim)
+    Int8Tensor *w2; // (layer, dim, hidden_dim)
+    Int8Tensor *w3; // (layer, hidden_dim, dim)
 
-    // Final RMSNorm weights
-    float *rms_final_weight; // (dim,)
-
-    // (optional) classifier weights for the logits, on the last layer - classifier weights (optionally shared with token embedding)
-    QuantizedTensor *wcls;
-} TransformerWeights;
+    Int8Tensor *wcls; // (optional) classifier weights for the logits (optionally shared with token embedding)
+} Qwen3Weights;
 
 // 1.3. Runtime state and cache
 // Activation flow: Starting from token embedding x, through attention and FFN computation, activations are passed and transformed between caches like xb, hb, finally outputting logits
@@ -101,8 +79,8 @@ typedef struct {
     float *hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
 
     // Quantization buffers - quantized activation values, some computations may be accelerated based on quantized state
-    QuantizedTensor xq; // quantized x (dim,)
-    QuantizedTensor hq; // quantized hb (hidden_dim,)
+    Int8Tensor xq; // quantized x (dim,)
+    Int8Tensor hq; // quantized hb (hidden_dim,)
 
     // Query, key, value vectors - related to self-attention mechanism
     float *q; // query (dim,)
@@ -122,7 +100,7 @@ typedef struct {
 typedef struct {
     // Integrate model core components - package configuration, weights, runtime state together, allowing convenient access to all resources during model inference, achieving one-stop management from model loading (reading config, weights) to inference (using state to store intermediate results)
     Config config; // the hyperparameters of the architecture (the blueprint) - hyperparameter blueprint
-    TransformerWeights weights; // model weights
+    Qwen3Weights weights; // model weights
     RunState state; // buffers for the "wave" of activations in the forward pass - inference runtime state
 
     // Memory mapping advantages - Large model weight files are big, using mmap to map to memory avoids loading everything into memory, allows inference to run on machines with limited memory
@@ -133,6 +111,7 @@ typedef struct {
 // Memory management function 1
 // Allocation strategy: Based on parameters in Config, precisely calculate memory requirements for each part, allocate space for attention, FFN, KV cache etc., ensure data has storage during inference.
 void malloc_run_state(RunState* s, Config *p) {
+    int QGS = p->qgroup_size;
     // we calloc instead of malloc to keep valgrind happy
     // calloc: dynamic memory allocation with zero initialization (function)
     // malloc: dynamic memory allocation function in C language
@@ -147,9 +126,9 @@ void malloc_run_state(RunState* s, Config *p) {
     s->xb2 = calloc(p->dim, sizeof(float));
     s->hb = calloc(p->hidden_dim, sizeof(float));
     s->hb2 = calloc(p->hidden_dim, sizeof(float));
-    // Quantization-related memory, allocate scaling factor arrays grouped by group_size (GS)
-    s->xq = (QuantizedTensor) { .q = calloc(all_heads_dim, sizeof(int8_t)), .s = calloc(all_heads_dim / GS, sizeof(float)) };
-    s->hq = (QuantizedTensor) { .q = calloc(p->hidden_dim, sizeof(int8_t)), .s = calloc(p->hidden_dim / GS, sizeof(float)) };
+    // Quantization-related memory, allocate scaling factor arrays grouped by group_size (QGS)
+    s->xq = (Int8Tensor) { .q = calloc(all_heads_dim, sizeof(int8_t)), .s = calloc(all_heads_dim / QGS, sizeof(float)) };
+    s->hq = (Int8Tensor) { .q = calloc(p->hidden_dim, sizeof(int8_t)), .s = calloc(p->hidden_dim / QGS, sizeof(float)) };
     s->q = calloc(all_heads_dim, sizeof(float));
     s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
     s->logits = calloc(p->vocab_size, sizeof(float));
@@ -195,26 +174,28 @@ void free_run_state(RunState* s) {
 
 // Dequantization function
 // Restore quantized int8 data to float32 format
-void dequantize(QuantizedTensor *qx, float *x, int n) {
+void dequantize(Int8Tensor *qx, float *x, int n, Config *config) {
+    int QGS = config->qgroup_size;
     for (int i = 0; i < n; i++) {
-        x[i] = qx->q[i] * qx->s[i / GS];
+        x[i] = qx->q[i] * qx->s[i / QGS];
         // qx->q[i]: stored quantized int8 value (-127~127)
-        // qx->s[i / GS]: scaling factor corresponding to current element (every GS elements share one scaling factor s)
+        // qx->s[i / QGS]: scaling factor corresponding to current element (every QGS elements share one scaling factor s)
     }
 }
 
 // Quantization function
-// Group quantization: Group weights by GS (usually 64) elements per group, each group independently calculates scaling factor, balancing precision and compression ratio
-void quantize(QuantizedTensor *qx, float *x, int n) {
-    int num_groups = n / GS;
+// Group quantization: Group weights by QGS (usually 64) elements per group, each group independently calculates scaling factor, balancing precision and compression ratio
+void quantize(Int8Tensor *qx, float *x, int n, Config *config) {
+    int QGS = config->qgroup_size;
+    int num_groups = n / QGS;
     float Q_MAX = 127.0f;// Map to int8 range
 
     // Find maximum absolute value within each group, calculate scaling factor
     for (int group = 0; group < num_groups; group++) {
         // Calculate maximum value within group
         float wmax = 0;
-        for (int i = 0; i < GS; i++) {
-            float val = fabs(x[group * GS + i]);
+        for (int i = 0; i < QGS; i++) {
+            float val = fabs(x[group * QGS + i]);
             if (val > wmax) {
                 wmax = val;
             }
@@ -225,10 +206,10 @@ void quantize(QuantizedTensor *qx, float *x, int n) {
         qx->s[group] = scale;
 
         // Quantize values and store
-        for (int i = 0; i < GS; i++) {
-            float quant_value = x[group * GS + i] / scale; // scale
+        for (int i = 0; i < QGS; i++) {
+            float quant_value = x[group * QGS + i] / scale; // scale
             int8_t quantized = (int8_t) round(quant_value); // round and clamp
-            qx->q[group * GS + i] = quantized;
+            qx->q[group * QGS + i] = quantized;
         }
     }
 }
@@ -237,15 +218,16 @@ void quantize(QuantizedTensor *qx, float *x, int n) {
 /* Memory layout:
 Quantized values (int8) stored consecutively
 Scaling factors (float) follow immediately after
-For example, layout (when GS=64): [q0,q1,...,q63,s0,q64,...,q127,s1,...]
+For example, layout (when QGS=64): [q0,q1,...,q63,s0,q64,...,q127,s1,...]
 */
 
 // 2.2.1. Quantized tensor initialization
 // Zero-copy design: directly map memory blocks to QuantizedTensor structure. Avoid data copying, improve loading speed
 /* initialize `n` x quantized tensor (with `size_each` elements), starting from memory pointed at *ptr */
-QuantizedTensor *init_quantized_tensors(void **ptr, int n, int size_each) {
+Int8Tensor *init_quantized_tensors(void **ptr, int n, int size_each, Config *config) {
+    int QGS = config->qgroup_size;
     void *p = *ptr;
-    QuantizedTensor *res = malloc(n * sizeof(QuantizedTensor));
+    Int8Tensor *res = malloc(n * sizeof(Int8Tensor));
 
     for (int i = 0; i < n; i++) {
         // map quantized int8 values
@@ -253,14 +235,14 @@ QuantizedTensor *init_quantized_tensors(void **ptr, int n, int size_each) {
         p = (int8_t*)p + size_each;
         // Map scaling factors
         res[i].s = (float*)p;
-        p = (float*)p + size_each / GS;
+        p = (float*)p + size_each / QGS;
     }
     *ptr = p; // Update pointer position
     return res;
 }
 
 // 2.2.2. Weight memory mapping
-void memory_map_weights(TransformerWeights *w, Config *p, void *ptr) {
+void memory_map_weights(Qwen3Weights *w, Config *p, void *ptr) {
     // first are the parameters that are kept in fp32 (the rmsnorm (1D) weights) - load FP32 RMSNorm weights
     float *fptr = (float*) ptr; // cast our pointer to float*
 
@@ -277,27 +259,27 @@ void memory_map_weights(TransformerWeights *w, Config *p, void *ptr) {
 
     // now read all the quantized weights - load quantized weights (through init_quantized_tensors function)
     ptr = (void *)fptr; // now cast the pointer back to void*
-    w->q_tokens = init_quantized_tensors(&ptr, 1, p->vocab_size * p->dim);
+    w->q_embedding_table = init_quantized_tensors(&ptr, 1, p->vocab_size * p->dim, p);
 
     // dequantize token embedding table - special handling: token embedding table needs dequantization
     w->token_embedding_table = malloc(p->vocab_size * p->dim * sizeof(float));
-    dequantize(w->q_tokens, w->token_embedding_table, p->vocab_size * p->dim);
+    dequantize(w->q_embedding_table, w->token_embedding_table, p->vocab_size * p->dim, p);
 
     // Load attention layer and FFN layer quantized weights
-    w->wq = init_quantized_tensors(&ptr, p->n_layers, p->dim * (p->n_heads * p->head_dim));
-    w->wk = init_quantized_tensors(&ptr, p->n_layers, p->dim * (p->n_kv_heads * p->head_dim));
-    w->wv = init_quantized_tensors(&ptr, p->n_layers, p->dim * (p->n_kv_heads * p->head_dim));
-    w->wo = init_quantized_tensors(&ptr, p->n_layers, (p->n_heads * p->head_dim) * p->dim);
+    w->wq = init_quantized_tensors(&ptr, p->n_layers, p->dim * (p->n_heads * p->head_dim), p);
+    w->wk = init_quantized_tensors(&ptr, p->n_layers, p->dim * (p->n_kv_heads * p->head_dim), p);
+    w->wv = init_quantized_tensors(&ptr, p->n_layers, p->dim * (p->n_kv_heads * p->head_dim), p);
+    w->wo = init_quantized_tensors(&ptr, p->n_layers, (p->n_heads * p->head_dim) * p->dim, p);
 
-    w->w1 = init_quantized_tensors(&ptr, p->n_layers, p->dim * p->hidden_dim);
-    w->w2 = init_quantized_tensors(&ptr, p->n_layers, p->hidden_dim * p->dim);
-    w->w3 = init_quantized_tensors(&ptr, p->n_layers, p->dim * p->hidden_dim);
+    w->w1 = init_quantized_tensors(&ptr, p->n_layers, p->dim * p->hidden_dim, p);
+    w->w2 = init_quantized_tensors(&ptr, p->n_layers, p->hidden_dim * p->dim, p);
+    w->w3 = init_quantized_tensors(&ptr, p->n_layers, p->dim * p->hidden_dim, p);
 
-    w->wcls = p->shared_classifier ? w->q_tokens : init_quantized_tensors(&ptr, 1, p->dim * p->vocab_size);
+    w->wcls = p->shared_classifier ? w->q_embedding_table : init_quantized_tensors(&ptr, 1, p->dim * p->vocab_size, p);
 }
 
 // 2.2.3. Checkpoint reading
-void read_checkpoint(char *checkpoint, Config *config, TransformerWeights* weights, float** data, ssize_t* file_size, int ctx_length) {
+void read_checkpoint(char *checkpoint, Config *config, Qwen3Weights* weights, float** data, ssize_t* file_size, int ctx_length) {
     // Open file and get size
     FILE *file = fopen(checkpoint, "rb");
     if (!file) { fprintf(stderr, "Couldn't open checkpoint %s\n", checkpoint); exit(EXIT_FAILURE); }
@@ -320,15 +302,13 @@ void read_checkpoint(char *checkpoint, Config *config, TransformerWeights* weigh
 
     // Read configuration information
     memcpy(config, *data, sizeof(Config));
-    if (config->magic_number != 0x616a6331) { fprintf(stderr, "File %s is not a qwen3.c checkpoint\n", checkpoint); exit(EXIT_FAILURE); }// Verify file signature
-    if (config->version != 1) { fprintf(stderr, "Checkpoint %s is version %d, need version 1\n", checkpoint, config->version); exit(EXIT_FAILURE); }
+    if (config->magic_number != 0x6E657771) { fprintf(stderr, "File %s is not a qwen3.c checkpoint\n", checkpoint); exit(EXIT_FAILURE); }// Verify file signature
 
     if (ctx_length != 0 && ctx_length <= config->seq_len)
         config->seq_len = ctx_length;
 
-    printf("hidden_size=%d, intermediate_size=%d, num_hidden_layers=%d, num_attention_heads=%d, num_kv_heads=%d, head_dim=%d, ctx_length=%d, vocab_size=%d, shared_classifier=%d, quantization_block_size=%d\n\n", config->dim, config->hidden_dim, config->n_layers, config->n_heads, config->n_kv_heads, config->head_dim, config->seq_len, config->vocab_size, config->shared_classifier, config->group_size);
+    printf("hidden_size=%d, intermediate_size=%d, num_hidden_layers=%d, num_attention_heads=%d, num_kv_heads=%d, head_dim=%d, ctx_length=%d, vocab_size=%d, shared_classifier=%d, quantization_block_size=%d\n\n", config->dim, config->hidden_dim, config->n_layers, config->n_heads, config->n_kv_heads, config->head_dim, config->seq_len, config->vocab_size, config->shared_classifier, config->qgroup_size);
 
-    GS = config->group_size; // Set global quantization parameter as it will be used in many places
 
     // Map weights
     void *weights_ptr = ((char *)*data) + 256; // Skip header (256 bytes)
@@ -350,7 +330,7 @@ void build_transformer(Transformer *t, char *checkpoint_path, int ctx_length) {
 // 5.2. Release model resources
 void free_transformer(Transformer *t) {
     // free QuantizedTensors - release quantized tensors
-    free(t->weights.q_tokens);
+    free(t->weights.q_embedding_table);
     free(t->weights.token_embedding_table);
     free(t->weights.wq);
     free(t->weights.wk);
@@ -359,7 +339,7 @@ void free_transformer(Transformer *t) {
     free(t->weights.w1);
     free(t->weights.w2);
     free(t->weights.w3);
-    if(t->weights.wcls != t->weights.q_tokens) { free(t->weights.wcls); }
+    if(t->weights.wcls != t->weights.q_embedding_table) { free(t->weights.wcls); }
 
     // close the memory mapping - unmap memory (avoid dangling pointers)
     if (t->data != MAP_FAILED) { munmap(t->data, t->file_size); }
@@ -412,7 +392,8 @@ void softmax(float *x, int size) {
 
 // 6.3. Quantized matrix multiplication (core computation of the model)
 // Uses OpenMP parallelization
-void matmul(float *xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
+void matmul(float *xout, Int8Tensor *x, Int8Tensor *w, int n, int d, Config *config) {
+    int QGS = config->qgroup_size;
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
     // inputs to this function are both quantized
@@ -422,13 +403,13 @@ void matmul(float *xout, QuantizedTensor *x, QuantizedTensor *w, int n, int d) {
         float val = 0;
         int in = i * n;
 
-        // Group quantized matrix multiplication by GS: improve cache hit rate
-        for (int j = 0; j <= n - GS; j += GS) {
+        // Group quantized matrix multiplication by QGS: improve cache hit rate
+        for (int j = 0; j <= n - QGS; j += QGS) {
             int32_t ival = 0;
-            for (int k = 0; k < GS; k++) {
+            for (int k = 0; k < QGS; k++) {
                 ival += x->q[j + k] * w->q[in + j + k];
             }
-            val += ((float) ival) * w->s[(in + j) / GS] * x->s[j / GS];
+            val += ((float) ival) * w->s[(in + j) / QGS] * x->s[j / QGS];
             // int8 multiplication accumulation followed by floating point operations: reduce number of floating point operations
         }
 
@@ -447,7 +428,7 @@ void resize_kv_cache(RunState* s, Config* p, int new_size) {
 float *forward(Transformer *transformer, int token, int pos) {
     // Initialize variables and cache references
     Config *p = &transformer->config;
-    TransformerWeights* w = &transformer->weights;
+    Qwen3Weights* w = &transformer->weights;
     RunState* s = &transformer->state;
     float *x = s->x;
     int dim = p->dim;
@@ -455,6 +436,7 @@ float *forward(Transformer *transformer, int token, int pos) {
     int kv_mul = p->n_heads / p->n_kv_heads; // Multi-query attention KV head reuse multiplier
     int hidden_dim =  p->hidden_dim;
     int all_heads_dim = p->n_heads * p->head_dim;
+    int half_head_dim = p->head_dim / 2;
 
     // copy the token embedding into x - load current token's word embedding vector
     memcpy(x, w->token_embedding_table + token*dim, dim * sizeof(float));
@@ -473,10 +455,10 @@ float *forward(Transformer *transformer, int token, int pos) {
 
         // Calculate QKV vectors - quantized matrix multiplication (core performance bottleneck)
         // Matrix multiplication optimization: matmul function uses OpenMP parallel computation, optimizes memory access by groups
-        quantize(&s->xq, s->xb, dim);
-        matmul(s->q, &s->xq, w->wq + l, dim, all_heads_dim);// Query matrix
-        matmul(s->k, &s->xq, w->wk + l, dim, kv_dim);       // Key matrix
-        matmul(s->v, &s->xq, w->wv + l, dim, kv_dim);       // Value matrix
+        quantize(&s->xq, s->xb, dim, p);
+        matmul(s->q, &s->xq, w->wq + l, dim, all_heads_dim, p);// Query matrix
+        matmul(s->k, &s->xq, w->wk + l, dim, kv_dim, p);       // Key matrix
+        matmul(s->v, &s->xq, w->wv + l, dim, kv_dim, p);       // Value matrix
 
         float *gq = w->q_ln_weights + l * p->head_dim;   // 128 floats
         float *gk = w->k_ln_weights + l * p->head_dim;   // 128 floats
@@ -489,7 +471,7 @@ float *forward(Transformer *transformer, int token, int pos) {
 
             // RoPE rotation (implemented with complex multiplication)
             for (int j = 0; j < p->head_dim/2; j++) {
-                float freq = powf(1e6, -(float)j / (p->head_dim/2));
+                float freq = powf(1e6, -(float)j / half_head_dim);
                 float cos_freq = cosf(pos * freq), sin_freq = sinf(pos * freq);
 
                 float x = q[j]; // real part
@@ -509,7 +491,7 @@ float *forward(Transformer *transformer, int token, int pos) {
 
             // Same RoPE rotation (uses same frequency as query heads but different position)
             for (int j = 0; j < p->head_dim/2; j++) {
-                float freq = powf(1e6, -(float)j / (p->head_dim/2));
+                float freq = powf(1e6, -(float)j / half_head_dim);
                 float cos_freq = cosf(pos * freq), sin_freq = sinf(pos * freq);
 
                 float x = k[j];
@@ -562,8 +544,8 @@ float *forward(Transformer *transformer, int token, int pos) {
         }
 
         // final matmul to get the output of the attention - attention output linear transformation
-        quantize(&s->xq, s->xb, all_heads_dim);
-        matmul(s->xb2, &s->xq, w->wo + l, all_heads_dim, dim);
+        quantize(&s->xq, s->xb, all_heads_dim, p);
+        matmul(s->xb2, &s->xq, w->wo + l, all_heads_dim, dim, p);
 
         // residual connection back into x - residual connection
         for (int i = 0; i < dim; i++) {
@@ -575,10 +557,10 @@ float *forward(Transformer *transformer, int token, int pos) {
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
-        quantize(&s->xq, s->xb, dim);
+        quantize(&s->xq, s->xb, dim, p);
         // Calculate two linear transformations of FFN: w1(x) and w3(x)
-        matmul(s->hb, &s->xq, w->w1 + l, dim, hidden_dim);
-        matmul(s->hb2, &s->xq, w->w3 + l, dim, hidden_dim);
+        matmul(s->hb, &s->xq, w->w1 + l, dim, hidden_dim, p);
+        matmul(s->hb2, &s->xq, w->w3 + l, dim, hidden_dim, p);
 
         // SwiGLU non-linearity - FFN layer computation (SwiGLU activation)
         // SwiGLU activation function: f(x) = silu(w1(x)) * w3(x), compared to ReLU, improves model expressiveness while maintaining computational efficiency
@@ -593,8 +575,8 @@ float *forward(Transformer *transformer, int token, int pos) {
         }
 
         // final matmul to get the output of the ffn - FFN output linear transformation 
-        quantize(&s->hq, s->hb, hidden_dim);
-        matmul(s->xb, &s->hq, w->w2 + l, hidden_dim, dim);// Final projection
+        quantize(&s->hq, s->hb, hidden_dim, p);
+        matmul(s->xb, &s->hq, w->w2 + l, hidden_dim, dim, p);// Final projection
 
         // residual connection
         for (int i = 0; i < dim; i++) {
@@ -606,8 +588,8 @@ float *forward(Transformer *transformer, int token, int pos) {
     rmsnorm(x, x, w->rms_final_weight, dim);
 
     // classifier into logits - final classifier
-    quantize(&s->xq, x, dim);
-    matmul(s->logits, &s->xq, w->wcls, dim, p->vocab_size);
+    quantize(&s->xq, x, dim, p);
+    matmul(s->logits, &s->xq, w->wcls, dim, p->vocab_size, p);
 
     return s->logits; // Return probability distribution over vocabulary
 }
@@ -680,18 +662,17 @@ void build_tokenizer(Tokenizer *t, char *checkpoint_path, int vocab_size, int en
     fread(&t->bos_token_id, sizeof(int), 1, file);
     fread(&t->eos_token_id, sizeof(int), 1, file);
 
-    int len;
-
     // Read each token and its merge score
+    int len;
     for (int i = 0; i < vocab_size; i++) {
         if (fread(t->merge_scores + i, sizeof(float), 1, file) != 1) {
           t->vocab[i] = (char *)malloc(1);
-          t->vocab[i][0] = '\0'; //  Add string terminator
+          t->vocab[i][0] = '\0'; //  Add terminators
         } else {
           fread(&len, sizeof(int), 1, file);
           t->vocab[i] = (char *)malloc(len + 1);
           fread(t->vocab[i], 1, len, file);
-          t->vocab[i][len] = '\0'; // Add string terminator
+          t->vocab[i][len] = '\0'; // Add terminators
         }
     }
     fclose(file);
@@ -1153,16 +1134,9 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char
     free(prompt_tokens);
 }
 
-
-// ----------------------------------------------------------------------------
-// 7. CLI command line interface
-
-// 7.1. Error prompt and usage instruction function
 void error_usage() {
-    // Output program usage format
-    fprintf(stderr, "Usage:   runq <checkpoint> [options]\n");
-    fprintf(stderr, "Example: runq Qwen3-4B.bin -r 1\n");
-    // Output available options and descriptions
+    fprintf(stderr, "Usage:   qwen3 <checkpoint> [options]\n");
+    fprintf(stderr, "Example: qwen3 Qwen3-4B.bin -r 1\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -t <float>  temperature in [0,inf], default 1.0\n");
     fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1], default 0.9\n");
@@ -1172,7 +1146,6 @@ void error_usage() {
     fprintf(stderr, "  -i <string> input prompt\n");
     fprintf(stderr, "  -y <string> system prompt in chat mode, default is none\n");
     fprintf(stderr, "  -r <int>    reasoning mode, 0 (default) = no thinking, 1 = thinking\n");
-    // Exit program and return error status
     exit(EXIT_FAILURE);
 }
 
