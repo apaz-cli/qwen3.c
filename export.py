@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import argparse
 import gzip
 import json
@@ -15,9 +17,6 @@ from model import ModelArgs, Transformer
 
 import json
 from jinja2 import Template
-
-# -----------------------------------------------------------------------------
-# common utilities
 
 
 def serialize_fp32(file, tensor):

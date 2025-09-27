@@ -1,21 +1,14 @@
 /* Inference for Qwen-3 Transformer model in pure C, int8 quantized forward pass. */
-/* This code implements pure C inference for the Qwen-3 Transformer model, specifically optimized for int8 quantization */
-// Improvement strategy: Add AVX2/AVX512 instruction sets to optimize matrix multiplication
 
-#include <stdio.h>      // Basic input/output and file handling
-#include <stdlib.h>     // General utility functions
-#include <stdint.h>     // Standard integer type definitions like int8_t (8-bit signed integer), uint16_t (16-bit unsigned integer) etc. - for portability
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
 #include <time.h>
 #include <math.h>
-#include <string.h>     // String operations
-#include <fcntl.h>      // File control (file opening, setting file attributes, etc.)
-
-#if defined _WIN32      // Check if current compilation environment is Windows platform (_WIN32 is a macro defined by default on Windows compilers)
-    #include "win.h"    // If Windows platform, include custom win.h header file
-#else
-    #include <unistd.h>
-    #include <sys/mman.h>   // Both are Unix-like system header files
-#endif
+#include <string.h>
+#include <unistd.h>
+#include <sys/mman.h>   // Both are Unix-like system header files
 
 
 typedef struct {
@@ -84,7 +77,7 @@ typedef struct {
 
     // Query, key, value vectors - related to self-attention mechanism
     float *q; // query (dim,)
-    float *k; // key (dim,)        
+    float *k; // key (dim,)
     float *v; // value (dim,)
 
     float *att; // buffer for scores/attention values (n_heads, seq_len) - attention scores
@@ -108,83 +101,71 @@ typedef struct {
     ssize_t file_size; // model file size - assists memory mapping management
 } Transformer;
 
-// Memory management function 1
-// Allocation strategy: Based on parameters in Config, precisely calculate memory requirements for each part, allocate space for attention, FFN, KV cache etc., ensure data has storage during inference.
 void malloc_run_state(RunState* s, Config *p) {
     int QGS = p->qgroup_size;
-    // we calloc instead of malloc to keep valgrind happy
-    // calloc: dynamic memory allocation with zero initialization (function)
-    // malloc: dynamic memory allocation function in C language
 
-    // Calculate total attention head dimensions, KV head dimensions etc., prepare for memory allocation
     int all_heads_dim = p->n_heads * p->head_dim;
     int kv_dim = p->n_kv_heads * p->head_dim;
 
     // Allocate memory for caches and intermediate variables in runtime state one by one
-    s->x = calloc(p->dim, sizeof(float));
-    s->xb = calloc(all_heads_dim, sizeof(float));
-    s->xb2 = calloc(p->dim, sizeof(float));
-    s->hb = calloc(p->hidden_dim, sizeof(float));
-    s->hb2 = calloc(p->hidden_dim, sizeof(float));
-    // Quantization-related memory, allocate scaling factor arrays grouped by group_size (QGS)
-    s->xq = (Int8Tensor) { .q = calloc(all_heads_dim, sizeof(int8_t)), .s = calloc(all_heads_dim / QGS, sizeof(float)) };
-    s->hq = (Int8Tensor) { .q = calloc(p->hidden_dim, sizeof(int8_t)), .s = calloc(p->hidden_dim / QGS, sizeof(float)) };
-    s->q = calloc(all_heads_dim, sizeof(float));
-    s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
-    s->logits = calloc(p->vocab_size, sizeof(float));
-    // KV cache allocation, allocate large arrays by layer, sequence length, dimension to store historical key-values
-    s->key_cache = calloc(p->n_layers * (uint64_t)p->seq_len * kv_dim, sizeof(float));
-    s->value_cache = calloc(p->n_layers * (uint64_t)p->seq_len * kv_dim, sizeof(float));
+    size_t x_sz = p->dim * sizeof(float);
+    size_t xb_sz = all_heads_dim * sizeof(float);
+    size_t xb2_sz = all_heads_dim * sizeof(float);
+    size_t hb_sz = p->hidden_dim * sizeof(float);
+    size_t hb2_sz = p->hidden_dim * sizeof(float);
+    size_t xqq_sz = all_heads_dim * sizeof(int8_t);
+    size_t xqs_sz = all_heads_dim / QGS * sizeof(float);
+    size_t hqq_sz = p->hidden_dim * sizeof(int8_t);
+    size_t hqs_sz = p->hidden_dim / QGS * sizeof(float);
+    size_t q_sz = all_heads_dim * sizeof(float);
+    size_t att_sz = p->n_heads * p->seq_len * sizeof(float);
+    size_t logits_sz = p->vocab_size * sizeof(float);
+    size_t key_cache_sz = p->n_layers * (uint64_t)p->seq_len * kv_dim * sizeof(float);
+    size_t value_cache_sz = p->n_layers * (uint64_t)p->seq_len * kv_dim * sizeof(float);
 
-    // ensure all mallocs went fine - memory allocation verification, prevent inference crashes due to insufficient memory
-    if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
-     || !s->att || !s->logits || !s->key_cache
-     || !s->value_cache) {
+    char* buffer = malloc(x_sz + xb_sz + xb2_sz + hb_sz + hb2_sz
+        + xqq_sz + xqs_sz + hqq_sz + hqs_sz
+        + q_sz + att_sz + logits_sz
+        + key_cache_sz + value_cache_sz);
+    char* cur = buffer;
+
+    if (!buffer) {
         fprintf(stderr, "malloc failed!\n");
-        exit(EXIT_FAILURE);
+        exit(1);
     }
+
+    s->x = ((float*)cur); cur += x_sz;
+    s->xb = ((float*)cur); cur += xb_sz;
+    s->xb2 = ((float*)cur); cur += xb2_sz;
+    s->hb = ((float*)cur); cur += hb_sz;
+    s->hb2 = ((float*)cur); cur += hb2_sz;
+
+    int8_t * xqq = ((int8_t*)cur); cur += xqq_sz;
+    float* xqs = ((float*)cur); cur += xqs_sz;
+    int8_t * hqq = ((int8_t*)cur); cur += hqq_sz;
+    float* hqs = ((float*)cur); cur += hqs_sz;
+    s->xq = (Int8Tensor) { .q = xqq, .s = xqs };
+    s->hq = (Int8Tensor) { .q = hqq, .s = hqs };
+
+    s->q = ((float*)cur); cur += q_sz;
+    s->att = ((float*)cur); cur += att_sz;
+    s->logits = ((float*)cur); cur += logits_sz;
+
+    s->key_cache = ((float*)cur); cur += key_cache_sz;
+    s->value_cache = ((float*)cur); cur += value_cache_sz;
 }
 
-// Memory management function 2
-// After inference ends, promptly release dynamically allocated memory in RunState, otherwise multiple inferences will cause memory to continuously grow, eventually crashing the program.
-// Release order: corresponds to allocation order, ensure pointers are valid when released, prevent dangling pointer issues, avoid memory leaks.
 void free_run_state(RunState* s) {
     free(s->x);
-    free(s->xb);
-    free(s->xb2);
-    free(s->hb);
-    free(s->hb2);
-    free(s->xq.q);
-    free(s->xq.s);
-    free(s->hq.q);
-    free(s->hq.s);
-    free(s->q);
-    free(s->att);
-    free(s->logits);
-    free(s->key_cache);
-    free(s->value_cache);
 }
 
-// ----------------------------------------------------------------------------
-// Quantization functions
-// 2. Quantization and memory mapping
-
-// 2.1. Quantization / dequantization functions
-// Precision loss: int8 quantization introduces about 1-2% precision loss, but can be significantly reduced through group optimization
-
-// Dequantization function
-// Restore quantized int8 data to float32 format
 void dequantize(Int8Tensor *qx, float *x, int n, Config *config) {
     int QGS = config->qgroup_size;
     for (int i = 0; i < n; i++) {
         x[i] = qx->q[i] * qx->s[i / QGS];
-        // qx->q[i]: stored quantized int8 value (-127~127)
-        // qx->s[i / QGS]: scaling factor corresponding to current element (every QGS elements share one scaling factor s)
     }
 }
 
-// Quantization function
-// Group quantization: Group weights by QGS (usually 64) elements per group, each group independently calculates scaling factor, balancing precision and compression ratio
 void quantize(Int8Tensor *qx, float *x, int n, Config *config) {
     int QGS = config->qgroup_size;
     int num_groups = n / QGS;
@@ -282,7 +263,7 @@ void memory_map_weights(Qwen3Weights *w, Config *p, void *ptr) {
 void read_checkpoint(char *checkpoint, Config *config, Qwen3Weights* weights, float** data, ssize_t* file_size, int ctx_length) {
     // Open file and get size
     FILE *file = fopen(checkpoint, "rb");
-    if (!file) { fprintf(stderr, "Couldn't open checkpoint %s\n", checkpoint); exit(EXIT_FAILURE); }
+    if (!file) { fprintf(stderr, "Couldn't open checkpoint %s\n", checkpoint); exit(1); }
 
     fseek(file, 0, SEEK_END); // move file pointer to end of file
     *file_size = ftell(file); // get the file size, in bytes
@@ -295,14 +276,14 @@ void read_checkpoint(char *checkpoint, Config *config, Qwen3Weights* weights, fl
     Save memory bandwidth: avoid data copying of traditional fread+fwrite
     */
     *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, fileno(file), 0);
-    if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
+    if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(1); }
     fclose(file);// File can be closed after mapping
 
     // checkpoint format is 256-byte header, and then the model weights
 
     // Read configuration information
     memcpy(config, *data, sizeof(Config));
-    if (config->magic_number != 0x6E657771) { fprintf(stderr, "File %s is not a qwen3.c checkpoint\n", checkpoint); exit(EXIT_FAILURE); }// Verify file signature
+    if (config->magic_number != 0x6E657771) { fprintf(stderr, "File %s is not a qwen3.c checkpoint\n", checkpoint); exit(1); }// Verify file signature
 
     if (ctx_length != 0 && ctx_length <= config->seq_len)
         config->seq_len = ctx_length;
@@ -327,9 +308,7 @@ void build_transformer(Transformer *t, char *checkpoint_path, int ctx_length) {
     malloc_run_state(&t->state, &t->config);
 }
 
-// 5.2. Release model resources
 void free_transformer(Transformer *t) {
-    // free QuantizedTensors - release quantized tensors
     free(t->weights.q_embedding_table);
     free(t->weights.token_embedding_table);
     free(t->weights.wq);
@@ -343,16 +322,11 @@ void free_transformer(Transformer *t) {
 
     // close the memory mapping - unmap memory (avoid dangling pointers)
     if (t->data != MAP_FAILED) { munmap(t->data, t->file_size); }
-    
+
     // Release runtime state
     free_run_state(&t->state);
 }
 
-// ----------------------------------------------------------------------------
-// neural net blocks; the dynamics of the Transformer
-
-// 6. Core computation functions
-// 6.1. RMSNorm normalization
 void rmsnorm(float *o, float *x, float *weight, int size) {
     // Calculate root mean square
     float ss = 0;
@@ -367,24 +341,18 @@ void rmsnorm(float *o, float *x, float *weight, int size) {
     }
 }
 
-// 6.2. Softmax activation function
 void softmax(float *x, int size) {
-    // Calculate maximum value (numerical stability optimization)
     float max_val = 0;
     for (int i = 0; i < size; i++) {
         if (x[i] > max_val) {
             max_val = x[i];
         }
     }
-
-    // Exponentiate and sum
     float sum = 0;
     for (int i = 0; i < size; i++) {
-        x[i] = expf(x[i] - max_val);// Subtract maximum value to prevent exponential overflow
+        x[i] = expf(x[i] - max_val);
         sum += x[i];
     }
-
-    // normalize
     for (int i = 0; i < size; i++) {
         x[i] /= sum;
     }
@@ -476,7 +444,7 @@ float *forward(Transformer *transformer, int token, int pos) {
 
                 float x = q[j]; // real part
                 float y = q[j + p->head_dim/2]; // imag part
-                
+
                 // Trigonometric function implementation of rotation
                 q[j] = x * cos_freq - y * sin_freq; // Real part rotation
                 q[j + p->head_dim/2] = x * sin_freq + y * cos_freq; // Imaginary part rotation
@@ -574,7 +542,7 @@ float *forward(Transformer *transformer, int token, int pos) {
             s->hb[i] = val;
         }
 
-        // final matmul to get the output of the ffn - FFN output linear transformation 
+        // final matmul to get the output of the ffn - FFN output linear transformation
         quantize(&s->hq, s->hb, hidden_dim, p);
         matmul(s->xb, &s->hq, w->w2 + l, hidden_dim, dim, p);// Final projection
 
@@ -632,7 +600,7 @@ void load_prompt_template(char *checkpoint_path, char *out_template, int with_sy
     // Initialize output template buffer
     memset(out_template, 0, 1024);
     FILE *file = fopen(prompt_path, "rb");
-    if (!file) { fprintf(stderr, "Couldn't load prompt template %s\n", prompt_path); exit(EXIT_FAILURE); }
+    if (!file) { fprintf(stderr, "Couldn't load prompt template %s\n", prompt_path); exit(1); }
 
     fread(out_template, 1024, 1, file);     // Read template content
     fclose(file);
@@ -641,22 +609,22 @@ void load_prompt_template(char *checkpoint_path, char *out_template, int with_sy
 // 4.3. Build tokenizer
 // Function: Load tokenizer model from file, including vocabulary, merge scores and prompt templates
 void build_tokenizer(Tokenizer *t, char *checkpoint_path, int vocab_size, int enable_thinking) {
-    // Load vocabulary file
-    char tokenizer_path[1024];
 
-    // Concatenate tokenizer file path
+    char tokenizer_path[1024];
     strcpy(tokenizer_path, checkpoint_path);
     strcat(tokenizer_path, ".tokenizer");
 
-    // Initialize tokenizer parameters
     t->vocab_size = vocab_size;
-    // malloc space to hold the scores and the strings
     t->vocab = (char **)malloc(vocab_size * sizeof(char *));
     t->merge_scores = (float *)malloc(vocab_size * sizeof(float));
 
     // Open tokenizer file
     FILE *file = fopen(tokenizer_path, "rb");
-    if (!file) { fprintf(stderr, "Couldn't load tokenizer model %s\n", tokenizer_path); exit(EXIT_FAILURE); }
+    if (!file) {
+        fprintf(stderr, "Couldn't load tokenizer model %s\n", tokenizer_path);
+        exit(1);
+    }
+
     // Read tokenizer metadata
     fread(&t->max_token_length, sizeof(int), 1, file);
     fread(&t->bos_token_id, sizeof(int), 1, file);
@@ -677,16 +645,13 @@ void build_tokenizer(Tokenizer *t, char *checkpoint_path, int vocab_size, int en
     }
     fclose(file);
 
-    // Load prompt templates
     load_prompt_template(checkpoint_path, t->prompt_template, 0, enable_thinking);
     load_prompt_template(checkpoint_path, t->system_prompt_template, 1, enable_thinking);
 }
 
 // 4.4. Release tokenizer resources
 void free_tokenizer(Tokenizer *t) {
-    // Release string memory for each token
     for (int i = 0; i < t->vocab_size; i++) { free(t->vocab[i]); }
-    // Release vocabulary array and merge scores array
     free(t->vocab);
     free(t->merge_scores);
 }
@@ -797,7 +762,7 @@ void encode(Tokenizer *t, char *text, int *tokens, int *n_tokens) {
 
         // Exit loop when no merge pairs available
         if (best_idx == -1) {
-            break; 
+            break;
         }
 
         // Execute merge operation
@@ -823,14 +788,14 @@ void encode(Tokenizer *t, char *text, int *tokens, int *n_tokens) {
 typedef struct {
     float prob;     // Responsible for storing probability value of a certain token
     int index;      // Used to record the index corresponding to this probability value in the original vocabulary
-} ProbIndex; 
+} ProbIndex;
 
 // Function: This structure is used to store parameters required for sampling strategies during text generation
 typedef struct {
-    int vocab_size;     // Vocabulary size: limits the dimension of probability distribution
+    int vocab_size;       // Vocabulary size: limits the dimension of probability distribution
     ProbIndex *probindex; // Pointer to ProbIndex array. This array will be used as buffer during top-p sampling.
-    float temperature;  // Temperature parameter: mainly used to adjust the shape of probability distribution. Lower temperature makes distribution more concentrated, generating more deterministic text; higher temperature makes distribution more dispersed, making generated text more random.
-    float topp;         // Nucleus sampling probability threshold (p). In top-p sampling, only sample from the smallest token set whose cumulative probability exceeds p.
+    float temperature;    // Temperature parameter: mainly used to adjust the shape of probability distribution. Lower temperature makes distribution more concentrated, generating more deterministic text; higher temperature makes distribution more dispersed, making generated text more random.
+    float top_p;          // Nucleus sampling probability threshold (p). In top-p sampling, only sample from the smallest token set whose cumulative probability exceeds p.
     unsigned long long rng_state;// Random number generator state
 } Sampler;
 
@@ -929,7 +894,7 @@ int sample_topp(float *probabilities, int n, float topp, ProbIndex *probindex, f
 void build_sampler(Sampler *sampler, int vocab_size, float temperature, float topp, unsigned long long rng_seed) {
     sampler->vocab_size = vocab_size;
     sampler->temperature = temperature;
-    sampler->topp = topp;
+    sampler->top_p = topp;
     sampler->rng_state = rng_seed;
     // buffer only used with nucleus sampling; may not need but it's ~small
     sampler->probindex = malloc(sampler->vocab_size * sizeof(ProbIndex));
@@ -962,10 +927,12 @@ int sample(Sampler *sampler, float *logits) {
     if (sampler->temperature == 0) {
         // greedy argmax sampling: take the token with the highest probability
         next = sample_argmax(logits, sampler->vocab_size);// Greedy sampling
-    } 
+    }
     else {
-        // Apply temperature parameter
-        for (int q=0; q<sampler->vocab_size; q++) { logits[q] /= sampler->temperature; }
+        // Apply temperature
+        for (int q=0; q<sampler->vocab_size; q++) {
+            logits[q] /= sampler->temperature;
+        }
         // apply softmax to the logits to get the probabilities for next token - apply softmax to convert to probability distribution
         softmax(logits, sampler->vocab_size);// Temperature scaling
 
@@ -973,12 +940,12 @@ int sample(Sampler *sampler, float *logits) {
         float coin = random_f32(&sampler->rng_state);
 
         // we sample from this distribution to get the next token - select sampling strategy based on topp parameter
-        if (sampler->topp <= 0 || sampler->topp >= 1) {
+        if (sampler->top_p <= 0 || sampler->top_p >= 1) {
             next = sample_mult(logits, sampler->vocab_size, coin);// Multinomial sampling
-        } 
+        }
         else {
             //clamping the least likely tokens to zero
-            next = sample_topp(logits, sampler->vocab_size, sampler->topp, sampler->probindex, coin);// top-p sampling
+            next = sample_topp(logits, sampler->vocab_size, sampler->top_p, sampler->probindex, coin);// top-p sampling
         }
     }
     return next;
@@ -1000,7 +967,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     encode(tokenizer, prompt, prompt_tokens, &num_prompt_tokens);   // Use encode function to convert prompt to token sequence
     if (num_prompt_tokens < 1) {
         fprintf(stderr, "Please provide a prompt using -i <string> on the command line.\n");
-        exit(EXIT_FAILURE);// Check if there are valid tokens, otherwise terminate program
+        exit(1);// Check if there are valid tokens, otherwise terminate program
     }
 
     // start the main loop - generation main loop
@@ -1068,7 +1035,7 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char
     int prev_token;
     int pos = 0;     // position in the sequence
 
-    /******************* Dialogue main loop ******************/ 
+    /******************* Dialogue main loop ******************/
     // Alternately generate user/assistant replies
     while (1) {
         // if context window is exceeded, clear it
@@ -1146,7 +1113,7 @@ void error_usage() {
     fprintf(stderr, "  -i <string> input prompt\n");
     fprintf(stderr, "  -y <string> system prompt in chat mode, default is none\n");
     fprintf(stderr, "  -r <int>    reasoning mode, 0 (default) = no thinking, 1 = thinking\n");
-    exit(EXIT_FAILURE);
+    exit(1);
 }
 
 // 7.2. Main function
@@ -1164,9 +1131,9 @@ int main(int argc, char *argv[]) {
     int ctx_length = 0;         // context length - context window length
 
     // Parse command line arguments
-    if (argc >= 2) { 
+    if (argc >= 2) {
         checkpoint_path = argv[1];  // First parameter is model path
-    } 
+    }
     else {
          error_usage(); // Show help when no parameters
     }
