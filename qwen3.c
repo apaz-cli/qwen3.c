@@ -283,7 +283,7 @@ void read_checkpoint(char *checkpoint, Config *config, Qwen3Weights* weights, fl
     if (ctx_length != 0 && ctx_length <= config->seq_len)
         config->seq_len = ctx_length;
 
-    printf("hidden_size=%d, intermediate_size=%d, num_hidden_layers=%d, num_attention_heads=%d, num_kv_heads=%d, head_dim=%d, ctx_length=%d, vocab_size=%d, shared_classifier=%d, quantization_block_size=%d\n\n", config->dim, config->hidden_dim, config->n_layers, config->n_heads, config->n_kv_heads, config->head_dim, config->seq_len, config->vocab_size, config->shared_classifier, config->qgroup_size);
+    printf("hidden_size=%d, intermediate_size=%d, num_hidden_layers=%d, num_attention_heads=%d, num_kv_heads=%d, head_dim=%d, ctx_length=%d, vocab_size=%d, shared_classifier=%d, quantization_block_size=%d\n", config->dim, config->hidden_dim, config->n_layers, config->n_heads, config->n_kv_heads, config->head_dim, config->seq_len, config->vocab_size, config->shared_classifier, config->qgroup_size);
 
 
     // Map weights
@@ -510,12 +510,12 @@ float *forward(Transformer *transformer, int token, int pos) {
         quantize(&s->xq, s->xb, all_heads_dim, p);
         matmul(s->xb2, &s->xq, w->wo + l, all_heads_dim, dim, p);
 
-        // residual connection back into x - residual connection
+        // residual connection back into x
         for (int i = 0; i < dim; i++) {
             x[i] += s->xb2[i];
         }
 
-        // FFN layer: RMSNorm
+        // FFN RMSNorm
         rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
@@ -617,7 +617,6 @@ char *decode(Tokenizer *t, int token) {
     return t->vocab[token];
 }
 
-// Simple string lookup
 int str_lookup(char *str, char **vocab, int vocab_size) {
     // Search for string in vocabulary, return index if found, otherwise return -1
     for (int i = 0; i < vocab_size; i++) {

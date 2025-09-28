@@ -231,14 +231,14 @@ def build_tokenizer(model, file):
     # Write to binary
     with open(file + ".tokenizer", "wb") as out_f:
         # Header: max_token_length, bos_token_id, eos_token_id
-        out_f.write(struct.pack("<I", max_token_length))
-        out_f.write(struct.pack("<I", model.bos_token_id))
-        out_f.write(struct.pack("<I", model.eos_token_id))
+        out_f.write(struct.pack("=I", max_token_length))
+        out_f.write(struct.pack("=I", model.bos_token_id))
+        out_f.write(struct.pack("=I", model.eos_token_id))
 
         for id, token in enumerate(all_tokens):
             token_bytes = internal_to_bytes(U2B, token)
             out_f.write(struct.pack("f", pseudo_scores[token]))  # merge score
-            out_f.write(struct.pack("<I", len(token_bytes)))  # 4 bytes: token length
+            out_f.write(struct.pack("=I", len(token_bytes)))  # 4 bytes: token length
             out_f.write(token_bytes)  # UTF-8 bytes
 
     print(f"Wrote tokenizer model to {file}.tokenizer")
