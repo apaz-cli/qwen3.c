@@ -27,8 +27,8 @@ fi
 
 if [ ! -f "Qwen3-0.6B.bin" ]; then
     pprint "Exporting model to Qwen3-0.6B.bin..."
-    python export.py Qwen3-0.6B.bin /tmp/Qwen3-0.6B
+    python export.py /tmp/Qwen3-0.6B Qwen3-0.6B.bin prompts.h
 fi
 
 pprint "Compiling qwen3.c to ./qwen3..."
-cc -Ofast -fopenmp -march=native qwen3.c -lm -o qwen3
+cc -fsanitize=address -g -Ofast -fopenmp -march=native qwen3.c -lm -o qwen3

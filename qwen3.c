@@ -8,7 +8,10 @@
 #include <math.h>
 #include <string.h>
 #include <unistd.h>
+#include <assert.h>
 #include <sys/mman.h>   // Both are Unix-like system header files
+
+#include "prompts.h"
 
 
 typedef struct {
@@ -156,7 +159,7 @@ void malloc_run_state(RunState* s, Config *p) {
 }
 
 void free_run_state(RunState* s) {
-    free(s->x);
+    
 }
 
 void dequantize(Int8Tensor *qx, float *x, int n, Config *config) {
@@ -169,7 +172,7 @@ void dequantize(Int8Tensor *qx, float *x, int n, Config *config) {
 void quantize(Int8Tensor *qx, float *x, int n, Config *config) {
     int QGS = config->qgroup_size;
     int num_groups = n / QGS;
-    float Q_MAX = 127.0f;// Map to int8 range
+    float Q_MAX = 127.0f;
 
     // Find maximum absolute value within each group, calculate scaling factor
     for (int group = 0; group < num_groups; group++) {
@@ -195,13 +198,6 @@ void quantize(Int8Tensor *qx, float *x, int n, Config *config) {
     }
 }
 
-// 2.2. Memory mapping and loading weights
-/* Memory layout:
-Quantized values (int8) stored consecutively
-Scaling factors (float) follow immediately after
-For example, layout (when QGS=64): [q0,q1,...,q63,s0,q64,...,q127,s1,...]
-*/
-
 // 2.2.1. Quantized tensor initialization
 // Zero-copy design: directly map memory blocks to QuantizedTensor structure. Avoid data copying, improve loading speed
 /* initialize `n` x quantized tensor (with `size_each` elements), starting from memory pointed at *ptr */
@@ -222,10 +218,9 @@ Int8Tensor *init_quantized_tensors(void **ptr, int n, int size_each, Config *con
     return res;
 }
 
-// 2.2.2. Weight memory mapping
-void memory_map_weights(Qwen3Weights *w, Config *p, void *ptr) {
+void mmap_weights(Qwen3Weights *w, Config *p, void *ptr) {
     // first are the parameters that are kept in fp32 (the rmsnorm (1D) weights) - load FP32 RMSNorm weights
-    float *fptr = (float*) ptr; // cast our pointer to float*
+    float *fptr = (float*) ptr;
 
     w->rms_att_weight = fptr;
     fptr += p->n_layers * p->dim;
@@ -293,7 +288,7 @@ void read_checkpoint(char *checkpoint, Config *config, Qwen3Weights* weights, fl
 
     // Map weights
     void *weights_ptr = ((char *)*data) + 256; // Skip header (256 bytes)
-    memory_map_weights(weights, config, weights_ptr);
+    mmap_weights(weights, config, weights_ptr);
 }
 
 // 5. Model construction and release
@@ -324,7 +319,7 @@ void free_transformer(Transformer *t) {
     if (t->data != MAP_FAILED) { munmap(t->data, t->file_size); }
 
     // Release runtime state
-    free_run_state(&t->state);
+    free(t->state.x);
 }
 
 void rmsnorm(float *o, float *x, float *weight, int size) {
@@ -559,55 +554,18 @@ float *forward(Transformer *transformer, int token, int pos) {
     quantize(&s->xq, x, dim, p);
     matmul(s->logits, &s->xq, w->wcls, dim, p->vocab_size, p);
 
-    return s->logits; // Return probability distribution over vocabulary
+    return s->logits;
 }
 
-// ----------------------------------------------------------------------------
-// The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
-// 4. Tokenizer and dialogue system
-
-// 4.1. Tokenizer data structure
 typedef struct {
-    char **vocab;   // Vocabulary (string array)
-    float *merge_scores;    // Merge scores (for BPE merging)
-    int vocab_size;   // Vocabulary size
-    unsigned int max_token_length;   // Maximum token length
-    unsigned int bos_token_id;  // Beginning of sequence token ID
-    unsigned int eos_token_id;  // End of sequence token ID
-    char prompt_template[1024]; // Prompt template
-    char system_prompt_template[1024];  // System prompt template
+    char **vocab;
+    float *merge_scores;
+    int vocab_size;
+    unsigned int max_token_length;
+    unsigned int bos_token_id;
+    unsigned int eos_token_id;
 } Tokenizer;
 
-// 4.2. Load prompt template function
-// Load different types of prompt templates based on parameters (with/without system prompt, with/without thinking process)
-/*
-Parameter description:
-checkpoint_path: Model checkpoint path, used to concatenate template file name
-out_template: Buffer to store read template content
-with_system_prompt: Whether to include system prompt
-enable_thinking: Whether to enable thinking process prompt
-*/
-void load_prompt_template(char *checkpoint_path, char *out_template, int with_system_prompt, int enable_thinking) {
-    char prompt_path[1024];
-
-    // Concatenate prompt template file path
-    strcpy(prompt_path, checkpoint_path);
-    if (with_system_prompt)
-      strcat(prompt_path, enable_thinking ? ".template.with-system-and-thinking" : ".template.with-system");
-    else
-      strcat(prompt_path, enable_thinking ? ".template.with-thinking" : ".template");
-
-    // Initialize output template buffer
-    memset(out_template, 0, 1024);
-    FILE *file = fopen(prompt_path, "rb");
-    if (!file) { fprintf(stderr, "Couldn't load prompt template %s\n", prompt_path); exit(1); }
-
-    fread(out_template, 1024, 1, file);     // Read template content
-    fclose(file);
-}
-
-// 4.3. Build tokenizer
-// Function: Load tokenizer model from file, including vocabulary, merge scores and prompt templates
 void build_tokenizer(Tokenizer *t, char *checkpoint_path, int vocab_size, int enable_thinking) {
 
     char tokenizer_path[1024];
@@ -644,25 +602,21 @@ void build_tokenizer(Tokenizer *t, char *checkpoint_path, int vocab_size, int en
         }
     }
     fclose(file);
-
-    load_prompt_template(checkpoint_path, t->prompt_template, 0, enable_thinking);
-    load_prompt_template(checkpoint_path, t->system_prompt_template, 1, enable_thinking);
 }
 
-// 4.4. Release tokenizer resources
+
 void free_tokenizer(Tokenizer *t) {
-    for (int i = 0; i < t->vocab_size; i++) { free(t->vocab[i]); }
+    for (int i = 0; i < t->vocab_size; i++) {
+        free(t->vocab[i]);
+    }
     free(t->vocab);
     free(t->merge_scores);
 }
 
-// 4.5. Tokenizer core functionality 1
-// Decode: convert token ID to string
 char *decode(Tokenizer *t, int token) {
     return t->vocab[token];
 }
 
-// 4.5.0. Encoding and decoding tools
 // Simple string lookup
 int str_lookup(char *str, char **vocab, int vocab_size) {
     // Search for string in vocabulary, return index if found, otherwise return -1
@@ -778,16 +732,12 @@ void encode(Tokenizer *t, char *text, int *tokens, int *n_tokens) {
     free(str_buffer);
 }
 
-// ----------------------------------------------------------------------------
-// The Sampler, which takes logits and returns a sampled token
-// sampling can be done in a few ways: greedy argmax, sampling, top-p sampling
-// 3. Sampler
 
-// 3.1. Sampler data structures
-// Function: Associate probability values with corresponding vocabulary indices during top-p sampling
+// sampling can be done in a few ways: greedy argmax, sampling, top-p sampling
+
 typedef struct {
     float prob;     // Responsible for storing probability value of a certain token
-    int index;      // Used to record the index corresponding to this probability value in the original vocabulary
+    int vocab_idx;      // Used to record the index corresponding to this probability value in the original vocabulary
 } ProbIndex;
 
 // Function: This structure is used to store parameters required for sampling strategies during text generation
@@ -857,7 +807,7 @@ int sample_topp(float *probabilities, int n, float topp, ProbIndex *probindex, f
     const float cutoff = (1.0f - topp) / (n - 1);
     for (int i = 0; i < n; i++) {
         if (probabilities[i] >= cutoff) {
-            probindex[n0].index = i;
+            probindex[n0].vocab_idx = i;
             probindex[n0].prob = probabilities[i];
             n0++;
         }
@@ -883,10 +833,10 @@ int sample_topp(float *probabilities, int n, float topp, ProbIndex *probindex, f
     for (int i = 0; i <= last_idx; i++) {
         cdf += probindex[i].prob;
         if (r < cdf) {
-            return probindex[i].index;
+            return probindex[i].vocab_idx;
         }
     }
-    return probindex[last_idx].index; // in case of rounding errors
+    return probindex[last_idx].vocab_idx; // in case of rounding errors
 }
 
 // 3.5. Sampler initialization and resource management
@@ -905,20 +855,15 @@ void free_sampler(Sampler *sampler) {
     free(sampler->probindex);
 }
 
-// Random number generator
-unsigned int random_u32(unsigned long long *state) {
-    // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
-    // xorshift algorithm generates 32-bit random numbers
+// random float32 in [0,1)
+float xorshift_f32(unsigned long long *state) {
     *state ^= *state >> 12;
     *state ^= *state << 25;
     *state ^= *state >> 27;
-    return (*state * 0x2545F4914F6CDD1Dull) >> 32;
-}
-float random_f32(unsigned long long *state) { // random float32 in [0,1) - convert to [0,1) floating point number
-    return (random_u32(state) >> 8) / 16777216.0f;
+    unsigned int randn = (*state * 0x2545F4914F6CDD1Dull) >> 32;
+    return (randn >> 8) / 16777216.0f;
 }
 
-// 3.6. Unified sampling interface
 // Sampling strategies: Support greedy, multinomial, top-p three sampling methods
 // Temperature parameter: Control output randomness, temperature=0 for completely deterministic (greedy sampling)
 int sample(Sampler *sampler, float *logits) {
@@ -937,7 +882,7 @@ int sample(Sampler *sampler, float *logits) {
         softmax(logits, sampler->vocab_size);// Temperature scaling
 
         // flip a (float) coin (this is our source of entropy for sampling) - random number generation
-        float coin = random_f32(&sampler->rng_state);
+        float coin = xorshift_f32(&sampler->rng_state);
 
         // we sample from this distribution to get the next token - select sampling strategy based on topp parameter
         if (sampler->top_p <= 0 || sampler->top_p >= 1) {
@@ -951,11 +896,23 @@ int sample(Sampler *sampler, float *logits) {
     return next;
 }
 
-// ----------------------------------------------------------------------------
-// generation loop
+typedef struct {
+    const char* template;
+    int uses_system;
+} PromptTemplate;
 
-// 4.7. Text generation function
-// Function: Generate text based on prompt, implement [single-round text generation], including tokenization and token decoding process
+void render_prompt_template(PromptTemplate* prompt_template, char* system_prompt, char* user_prompt, char* output) {
+    assert(prompt_template != NULL);
+    assert(user_prompt != NULL);
+    assert(output != NULL);
+    assert((!prompt_template->uses_system && system_prompt == NULL) || (prompt_template->uses_system && system_prompt != NULL));
+    if (prompt_template->uses_system && system_prompt) {
+        sprintf(output, prompt_template->template, system_prompt, user_prompt);
+    } else {
+        sprintf(output, prompt_template->template, user_prompt);
+    }
+}
+
 void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt) {
 // Parameters: transformer: model. tokenizer: tokenizer. sampler: sampler. prompt: input prompt
     char *empty_prompt = "";
@@ -1000,55 +957,31 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     free(prompt_tokens);
 }
 
-// Helper function: read from standard input
-// Function: Read one line of text from standard input; remove newline character at end of line; used for 4.8. interactive input scenarios
-void read_stdin(const char *guide, char *buffer, size_t bufsize) {
-    // Read one line from stdin, not including newline character \n
-    printf("%s", guide);
-    if (fgets(buffer, bufsize, stdin) != NULL) {
-        size_t len = strlen(buffer);
-        if (len > 0 && buffer[len - 1] == '\n') {
-            buffer[len - 1] = '\0'; // strip newline - remove newline character
-        }
-    }
-}
-
-// ----------------------------------------------------------------------------
-// chat loop
-// 4.8. Dialogue loop
-// Function: Implement [multi-turn dialogue interaction], including prompt rendering, tokenization and reply generation
-// Prompt template: Support system prompt + user input in Llama2 dialogue format
-// Context management: Track sequence position through pos variable, implement multi-turn dialogue
-// User input prompt -> through encode function -> input token sequence -> generation -> output token sequence -> through decode function -> output string
-void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *cli_user_prompt, char *system_prompt) {
-    // buffers for reading the system prompt and user prompt from stdin
+void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, PromptTemplate* prompt_template, char *system_prompt, char *cli_user_prompt) {
     char user_prompt[32768];
     char rendered_prompt[32768];
     int num_prompt_tokens = 0;
     int *prompt_tokens = (int *)malloc(32768 * sizeof(int));
     int user_idx;
 
-    // start the main loop
-    int8_t user_turn = 1; // user starts
-    int next;        // will store the next token in the sequence
-    int token;       // stores the current token to feed into the transformer
+    int8_t user_turn = 1;
+    int next_token;
     int prev_token;
-    int pos = 0;     // position in the sequence
-
-    /******************* Dialogue main loop ******************/
-    // Alternately generate user/assistant replies
+    int ctx_pos = 0;
     while (1) {
         // if context window is exceeded, clear it
-        if (pos >= transformer->config.seq_len) {
-            printf("\n\n");
+        if (ctx_pos >= transformer->config.seq_len) {
+            printf("\n\nCONTEXT WINDOW EXCEEDED, RESETTING\n\n");
             user_turn = 1;
-            pos = 0;
+            ctx_pos = 0;
         }
 
-        // Handle user input phase
+        // Handle user input phase.
+        // If a cli prompt is passed, we catch that here and immediately respond.
+        // Otherwise, we ask the user for input.
         if (user_turn) {
             // get the user prompt - read user input and encode, or use prompt from command line arguments
-            if (pos == 0 && cli_user_prompt != NULL) {
+            if (ctx_pos == 0 && cli_user_prompt != NULL) {
                 // user prompt for position 0 was passed in, use it
                 strcpy(user_prompt, cli_user_prompt);
             } else {
@@ -1056,18 +989,23 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char
                     break;
                 }
                 // otherwise get user prompt from stdin
-                read_stdin("> ", user_prompt, sizeof(user_prompt));
-                if (!user_prompt[0]) {
-                    // Terminate if user enters a blank prompt
+                // Read one line from stdin, not including newline character \n
+                printf("%s", "> ");
+                if (fgets(user_prompt, sizeof(user_prompt), stdin) != NULL) {
+                    size_t len = strlen(user_prompt);
+                    if (len && user_prompt[len - 1] == '\n') {
+                        user_prompt[len - 1] = '\0';
+                    }
+                }
+                if (!user_prompt[0] || !strcmp(user_prompt, "exit")) {
                     break;
                 }
             }
-            // render user/system prompts into the Llama 2 Chat schema - render prompt (apply Llama2 dialogue format)
-            if (pos == 0 && system_prompt) {
-                sprintf(rendered_prompt, tokenizer->system_prompt_template, system_prompt, user_prompt);
-            } else {
-                sprintf(rendered_prompt, tokenizer->prompt_template, user_prompt);
+
+            if (!ctx_pos) {
+                render_prompt_template(prompt_template, system_prompt, user_prompt, rendered_prompt);
             }
+
 
             // Encode rendered prompt to token sequence
             encode(tokenizer, rendered_prompt, prompt_tokens, &num_prompt_tokens);
@@ -1075,28 +1013,26 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char
             user_turn = 0;
         }
 
-        // determine the token to pass into the transformer next - determine token to input to model
-        if (user_idx < num_prompt_tokens) {
-            // if we are still processing the input prompt, force the next prompt token
-            token = prompt_tokens[user_idx++];
-        } else {
-            // otherwise use the next token sampled from previous turn
-            token = next;
-        }
+        // Process the full user prompt first (one at a time through the outer loop)
+        // Then, do the reply
+        int current_token = (user_idx < num_prompt_tokens) ? prompt_tokens[user_idx++] : next_token;
+
         // EOS token ends the Assistant turn
-        if (user_idx >= num_prompt_tokens && (token == tokenizer->bos_token_id || token == tokenizer->eos_token_id)) { user_turn = 1; }
+        if (user_idx >= num_prompt_tokens && (current_token == tokenizer->bos_token_id || current_token == tokenizer->eos_token_id)) {
+            user_turn = 1;
+        }
 
         // forward the transformer to get logits for the next token - model generates reply
-        float *logits = forward(transformer, token, pos);
-        next = sample(sampler, logits);
-        pos++;
+        float *logits = forward(transformer, current_token, ctx_pos);
+        next_token = sample(sampler, logits);
+        ctx_pos++;
 
         // Output assistant reply (decode token to string)
-        if (user_idx >= num_prompt_tokens && next != tokenizer->bos_token_id && next != tokenizer->eos_token_id) {
-            printf("%s", decode(tokenizer, next));
+        if (user_idx >= num_prompt_tokens && next_token != tokenizer->bos_token_id && next_token != tokenizer->eos_token_id) {
+            printf("%s", decode(tokenizer, next_token));
             fflush(stdout);
         }
-        if (user_idx >= num_prompt_tokens && (next == tokenizer->bos_token_id || next == tokenizer->eos_token_id)) { printf("\n"); }
+        if (user_idx >= num_prompt_tokens && (next_token == tokenizer->bos_token_id || next_token == tokenizer->eos_token_id)) { printf("\n"); }
     }
     free(prompt_tokens);
 }
@@ -1123,7 +1059,7 @@ int main(int argc, char *argv[]) {
     char *checkpoint_path = NULL;  // e.g. out/model.bin - model checkpoint path (must be specified)
     float temperature = 1.0f;   // 0 = greedy deterministic. 1.0 = original. don't set higher - sampling temperature, controls output randomness (0 means deterministic output, higher values mean more random output)
     float topp = 0.9f;          // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower - top-p sampling threshold: minimum cumulative probability retained during top-p sampling
-    char *prompt = NULL;        // prompt string - input prompt
+    char *cli_user_prompt = NULL;        // prompt string - input prompt
     unsigned long long rng_seed = 0; // seed rng with time by default - random number seed
     char *mode = "chat";        // Running mode: generate (single-round text generation) or chat (multi-turn dialogue)
     char *system_prompt = NULL; // (optional) system prompt for dialogue mode
@@ -1148,7 +1084,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'p') { topp = atof(argv[i + 1]); }
         else if (argv[i][1] == 's') { rng_seed = atoi(argv[i + 1]); }
         else if (argv[i][1] == 'c') { ctx_length = atoi(argv[i + 1]); }
-        else if (argv[i][1] == 'i') { prompt = argv[i + 1]; }
+        else if (argv[i][1] == 'i') { cli_user_prompt = argv[i + 1]; }
         else if (argv[i][1] == 'm') { mode = argv[i + 1]; }
         else if (argv[i][1] == 'y') { system_prompt = argv[i + 1]; }
         else if (argv[i][1] == 'r') { enable_thinking = atoi(argv[i + 1]); }
@@ -1172,12 +1108,20 @@ int main(int argc, char *argv[]) {
     Sampler sampler;
     build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);// Call build_sampler to set sampling strategy parameters (temperature, top-p, etc.)
 
-    // run!
-    // Select running function based on mode
+    PromptTemplate prompt_template;
+    prompt_template.uses_system = (system_prompt != NULL);
+    prompt_template.template = enable_thinking
+                                ? ((system_prompt)
+                                    ? system_thinking_prompt_template
+                                    : thinking_prompt_template)
+                                : ((system_prompt)
+                                    ? system_prompt_template
+                                    : default_prompt_template);
+
     if (strcmp(mode, "generate") == 0) {
-        generate(&transformer, &tokenizer, &sampler, prompt);   // generate function receives prompt for generation
+        generate(&transformer, &tokenizer, &sampler, cli_user_prompt);
     } else if (strcmp(mode, "chat") == 0) {
-        chat(&transformer, &tokenizer, &sampler, prompt, system_prompt);    // chat function additionally receives system prompt for dialogue format construction
+        chat(&transformer, &tokenizer, &sampler, &prompt_template, system_prompt, cli_user_prompt);
     } else {
         fprintf(stderr, "Unknown mode: %s\n", mode);
         error_usage();
