@@ -8,6 +8,7 @@
 #include <math.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/mman.h>   // Both are Unix-like system header files
 
 #include "prompts.h"
@@ -103,7 +104,7 @@ typedef struct {
     Config config; // the hyperparameters of the architecture (the blueprint) - hyperparameter blueprint
     Qwen3Weights weights; // model weights
     RunState state; // buffers for the "wave" of activations in the forward pass - inference runtime state
-    
+
     float *data;
     ssize_t file_size;
 } Transformer;
@@ -232,6 +233,8 @@ void mmap_weights(Qwen3Weights *w, Config *p, void *ptr) {
     ptr = (void *)fptr; // now cast the pointer back to void*
 
     // Load token embedding table
+    // Theoretically, the embedding and classifier layer/layers should be left in fp32, but then I would have
+    // to implement an fp32 matmul, which would bloat the code. So I will not.
     init_quantized_tensor(&ptr, &w->q_embedding_table, p->vocab_size * p->dim, p);
 
     w->token_embedding_table = malloc(p->vocab_size * p->dim * sizeof(float));
@@ -267,41 +270,36 @@ void read_checkpoint(char *checkpoint, Config *config, Qwen3Weights* weights, fl
     fseek(file, 0, SEEK_END); // move file pointer to end of file
     *file_size = ftell(file); // get the file size, in bytes
 
-    // Use mmap for memory mapping
-    /*
-    mmap advantages:
-    Zero-copy loading: directly map file to process address space
-    Lazy loading mechanism: only actually accessed memory pages are loaded into physical memory
-    Save memory bandwidth: avoid data copying of traditional fread+fwrite
-    */
     *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, fileno(file), 0);
     if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(1); }
-    fclose(file);// File can be closed after mapping
+    fclose(file);
 
-    // checkpoint format is header, and then the model weights
     memcpy(config, *data, sizeof(Config));
-    if (config->magic_number != 0x6E657771) { fprintf(stderr, "File %s is not a qwen3.c checkpoint\n", checkpoint); exit(1); }// Verify file signature
-
-    if (ctx_length != 0 && ctx_length <= config->seq_len)
+    if (config->magic_number != 0x6E657771) { fprintf(stderr, "File %s is not a qwen3.c checkpoint\n", checkpoint); exit(1); }
+    if (ctx_length != 0 && ctx_length <= config->seq_len) {
         config->seq_len = ctx_length;
+    }
 
-    printf("hidden_size=%d, intermediate_size=%d, num_hidden_layers=%d, num_attention_heads=%d, num_kv_heads=%d, head_dim=%d, ctx_length=%d, vocab_size=%d, shared_classifier=%d, quantization_block_size=%d\n\n", config->dim, config->hidden_dim, config->n_layers, config->n_heads, config->n_kv_heads, config->head_dim, config->seq_len, config->vocab_size, config->shared_classifier, config->qgroup_size);
-
-
-    // Map weights
-    void *weights_ptr = ((char *)*data) + 256; // Skip header (256 bytes)
+    void *weights_ptr = ((char *)*data) + 4096; // Skip header (4096 bytes)
     mmap_weights(weights, config, weights_ptr);
+
+    printf("hidden_size=%d, "
+           "intermediate_size=%d, "
+           "num_hidden_layers=%d, "
+           "num_attention_heads=%d, "
+           "num_kv_heads=%d, "
+           "head_dim=%d, "
+           "ctx_length=%d, "
+           "vocab_size=%d, "
+           "shared_classifier=%d, "
+           "quantization_block_size=%d\n\n",
+           config->dim, config->hidden_dim, config->n_layers, config->n_heads,
+           config->n_kv_heads, config->head_dim, config->seq_len, config->vocab_size,
+           config->shared_classifier, config->qgroup_size);
 }
 
-// 5. Model construction and release
-// 5.1. Build Transformer model
-// Initialization process: first load static weights (through memory mapping), then allocate dynamic runtime cache (KV cache, activation values, etc.)
 void build_transformer(Transformer *t, char *checkpoint_path, int ctx_length) {
-    // Read checkpoint (configuration + weights)
     read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->data, &t->file_size, ctx_length);
-    // Through ctx_length parameter, can dynamically adjust maximum sequence length, support smaller context length than training time (save memory)
-
-    // Allocate runtime state
     malloc_run_state(&t->state, &t->config);
 }
 
@@ -548,6 +546,8 @@ typedef struct {
     unsigned int max_token_length;
     unsigned int bos_token_id;
     unsigned int eos_token_id;
+    void *data; // mmap'd data
+    size_t file_size;
 } Tokenizer;
 
 void build_tokenizer(Tokenizer *t, char *checkpoint_path, int vocab_size, int enable_thinking) {
@@ -556,45 +556,56 @@ void build_tokenizer(Tokenizer *t, char *checkpoint_path, int vocab_size, int en
     strcpy(tokenizer_path, checkpoint_path);
     strcat(tokenizer_path, ".tokenizer");
 
-    t->vocab_size = vocab_size;
-    t->vocab = (char **)malloc(vocab_size * sizeof(char *));
-    t->merge_scores = (float *)malloc(vocab_size * sizeof(float));
-
-    // Open tokenizer file
+    // Open and mmap tokenizer file
     FILE *file = fopen(tokenizer_path, "rb");
     if (!file) {
         fprintf(stderr, "Couldn't load tokenizer model %s\n", tokenizer_path);
         exit(1);
     }
 
-    // Read metadata
-    fread(&t->max_token_length, sizeof(int), 1, file);
-    fread(&t->bos_token_id, sizeof(int), 1, file);
-    fread(&t->eos_token_id, sizeof(int), 1, file);
-
-    // Read each token and its merge score
-    int len;
-    for (int i = 0; i < vocab_size; i++) {
-        if (fread(t->merge_scores + i, sizeof(float), 1, file) != 1) {
-          t->vocab[i] = (char *)malloc(1);
-          t->vocab[i][0] = '\0'; //  Add terminators
-        } else {
-          fread(&len, sizeof(int), 1, file);
-          t->vocab[i] = (char *)malloc(len + 1);
-          fread(t->vocab[i], 1, len, file);
-          t->vocab[i][len] = '\0'; // Add terminators
-        }
-    }
+    // Get file size
+    fseek(file, 0, SEEK_END);
+    t->file_size = ftell(file);
     fclose(file);
+
+    // Open for mmap
+    int fd = open(tokenizer_path, O_RDONLY);
+    if (fd == -1) {
+        fprintf(stderr, "Couldn't open tokenizer model %s\n", tokenizer_path);
+        exit(1);
+    }
+
+    // mmap the file
+    t->data = mmap(NULL, t->file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (t->data == MAP_FAILED) {
+        fprintf(stderr, "mmap failed for tokenizer\n");
+        exit(1);
+    }
+    close(fd);
+
+    // Parse header
+    uint32_t *header = (uint32_t *)t->data;
+    t->vocab_size = header[0];
+    t->max_token_length = header[1];
+    t->bos_token_id = header[2];
+    t->eos_token_id = header[3];
+
+    // Set up pointers into mmap'd data
+    char *ptr = (char *)t->data + 16; // skip 4x uint32_t header
+    t->merge_scores = (float *)ptr;
+    ptr += t->vocab_size * sizeof(float);
+
+    // Set up vocab pointers
+    t->vocab = (char **)malloc(t->vocab_size * sizeof(char *));
+    for (int i = 0; i < t->vocab_size; i++) {
+        t->vocab[i] = ptr + (i * t->max_token_length);
+    }
 }
 
 
 void free_tokenizer(Tokenizer *t) {
-    for (int i = 0; i < t->vocab_size; i++) {
-        free(t->vocab[i]);
-    }
     free(t->vocab);
-    free(t->merge_scores);
+    munmap(t->data, t->file_size);
 }
 
 char *decode(Tokenizer *t, int token) {

@@ -93,7 +93,7 @@ def model_export(model, filepath, group_size=64):
 
     # write
     out_file = open(filepath, "wb")
-    # first write out the header. the header will be 256 bytes
+    # first write out the header. the header will be 4096 bytes
     # write magic, which will be uint32 of "qwen" in ASCII
     out_file.write(struct.pack("I", 0x6E657771))
     # write the params
@@ -115,7 +115,7 @@ def model_export(model, filepath, group_size=64):
     )
     out_file.write(header)
 
-    pad = 256 - out_file.tell()  # pad rest with zeros; tell returns current pos
+    pad = 4096 - out_file.tell()  # pad rest with zeros; tell returns current pos
     assert pad >= 0
     out_file.write(b"\0" * pad)
     # now that the header is done, let's write out the model
@@ -255,20 +255,29 @@ def build_tokenizer(model, file):
             score = -1e6  # Initial vocab tokens
         pseudo_scores[token] = score
 
-    max_token_length = max(len(t) for t in all_tokens)
+    # Convert all tokens to bytes
+    token_bytes_list = [internal_to_bytes(U2B, t) for t in all_tokens]
+    max_token_length = max(len(tb) for tb in token_bytes_list)
 
-    # Write to binary
+    # Write to binary with mmap-friendly fixed-size layout
     with open(file + ".tokenizer", "wb") as out_f:
-        # Header: max_token_length, bos_token_id, eos_token_id
+        # Header: vocab_size, max_token_length, bos_token_id, eos_token_id
+        out_f.write(struct.pack("=I", len(all_tokens)))
         out_f.write(struct.pack("=I", max_token_length))
         out_f.write(struct.pack("=I", model.bos_token_id))
         out_f.write(struct.pack("=I", model.eos_token_id))
 
-        for id, token in enumerate(all_tokens):
-            token_bytes = internal_to_bytes(U2B, token)
-            out_f.write(struct.pack("f", pseudo_scores[token]))  # merge score
-            out_f.write(struct.pack("=I", len(token_bytes)))  # 4 bytes: token length
-            out_f.write(token_bytes)  # UTF-8 bytes
+        # Write all merge scores as contiguous array
+        for token in all_tokens:
+            out_f.write(struct.pack("f", pseudo_scores[token]))
+
+        # Write all token strings with fixed-size slots
+        for token_bytes in token_bytes_list:
+            # Write actual token bytes
+            out_f.write(token_bytes)
+            # Pad with zeros to max_token_length
+            padding = max_token_length - len(token_bytes)
+            out_f.write(b'\0' * padding)
 
     print(f"Wrote tokenizer model to {file}.tokenizer")
 
