@@ -3,6 +3,6 @@
 .vscode/*
 **/__pycache__/**
 
-Qwen3-0.6B.bin*
-qwen3
+Qwen3-*B.bin*
+qwen3-*B
 prompts.h

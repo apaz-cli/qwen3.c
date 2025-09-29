@@ -81,9 +81,9 @@ def model_export(model, filepath, group_size=64):
         *[layer.feed_forward.w2.weight for layer in model.layers],
         *[layer.feed_forward.w3.weight for layer in model.layers],
     ]
-    shared_classifier = torch.equal(model.tok_embeddings.weight, model.output.weight)
+    has_shared_classifier = torch.equal(model.tok_embeddings.weight, model.output.weight)
 
-    if not shared_classifier:
+    if not has_shared_classifier:
         weights.append(model.output.weight)
     for i, w in enumerate(weights):
         assert (
@@ -110,7 +110,7 @@ def model_export(model, filepath, group_size=64):
         p.vocab_size,
         p.max_seq_len,
         p.head_dim,
-        int(shared_classifier),
+        int(has_shared_classifier),
         group_size,
     )
     out_file.write(header)
@@ -285,22 +285,23 @@ def load_hf_model(model_path):
     hf_dict = hf_model.state_dict()
 
     # convert config to ModelArgs
-    config = ModelArgs()
+
 
     with open(os.path.join(model_path, "config.json"), "r") as f:
         config_json = json.load(f)
+    print(json.dumps(config_json, indent=2))
 
-    config.dim = config_json["hidden_size"]
-    config.n_layers = config_json["num_hidden_layers"]
-    config.n_heads = config_json["num_attention_heads"]
-    config.n_kv_heads = config_json["num_key_value_heads"]
-    config.vocab_size = config_json["vocab_size"]
-    config.hidden_dim = config_json["intermediate_size"]
-    config.norm_eps = config_json["rms_norm_eps"]
-    config.max_seq_len = config_json["max_position_embeddings"]
-    config.head_dim = config_json.get("head_dim", config.dim // config.n_heads)
-
-    print(config)
+    config = ModelArgs(
+        dim=config_json["hidden_size"],
+        n_layers=config_json["num_hidden_layers"],
+        n_heads=config_json["num_attention_heads"],
+        n_kv_heads=config_json["num_key_value_heads"],
+        vocab_size=config_json["vocab_size"],
+        hidden_dim=config_json["intermediate_size"],
+        norm_eps=config_json["rms_norm_eps"],
+        max_seq_len=config_json["max_position_embeddings"],
+        head_dim=config_json["head_dim"],
+    )
 
     # create a new Transformer object and set weights
     model = Transformer(config)
@@ -366,7 +367,7 @@ if __name__ == "__main__":
         print("Usage: export.py <huggingface_input_path> <output.bin> <output_prompts.h>")
         print("")
         print("e.g.   git clone https://huggingface.co/Qwen/Qwen3-4B")
-        print("       export.py Qwen3-4B.bin Qwen/Qwen3-4B")
+        print("       export.py Qwen/Qwen3-4B Qwen3-4B.bin prompts.h")
         print("")
         exit(0)
 

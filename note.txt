@@ -17,3 +17,12 @@ Traceback (most recent call last):
 safetensors_rust.SafetensorError: Error while deserializing header: header too large
 
 The solution is to install git lfs, remove /tmp/Qwen*, and re-run ./build.sh.
+
+    # Check if git lfs is installed
+    if ! command -v git-lfs >/dev/null; then
+        echo "Error: git-lfs is not installed. Please install it to proceed."
+        exit 1
+    fi
+
+
+Also need to create a swapfile of 300 GB just to do the conversion.

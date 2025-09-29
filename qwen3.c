@@ -8,11 +8,12 @@
 #include <math.h>
 #include <string.h>
 #include <unistd.h>
-#include <assert.h>
 #include <sys/mman.h>   // Both are Unix-like system header files
 
 #include "prompts.h"
 
+
+#define ub_assert(x) if (!(x)) { fprintf(stderr, "Assertion failed: %s\n", #x); exit(1); }
 
 typedef struct {
     int magic_number;
@@ -24,7 +25,7 @@ typedef struct {
     int vocab_size;
     int seq_len;
     int head_dim;
-    int shared_classifier; // For Qwen3-0.6B - 4B, the classifier is shared like in GPT2. For 14B - 32B, it is not.
+    int shared_classifier; // For Qwen3-0.6B - 4B, the classifier is shared like in GPT2. For 14B, 32B, it is not.
     int qgroup_size; // quantization group size (export.py uses 64) - balances precision and storage
 } Config;
 
@@ -158,12 +159,10 @@ void malloc_run_state(RunState* s, Config *p) {
     s->value_cache = ((float*)cur); cur += value_cache_sz;
 }
 
-void free_run_state(RunState* s) {
-    
-}
-
 void dequantize(Int8Tensor *qx, float *x, int n, Config *config) {
     int QGS = config->qgroup_size;
+    ub_assert(QGS % 2 == 0);
+    ub_assert(n % QGS == 0);
     for (int i = 0; i < n; i++) {
         x[i] = qx->q[i] * qx->s[i / QGS];
     }
@@ -254,7 +253,6 @@ void mmap_weights(Qwen3Weights *w, Config *p, void *ptr) {
     w->wcls = p->shared_classifier ? w->q_embedding_table : init_quantized_tensors(&ptr, 1, p->dim * p->vocab_size, p);
 }
 
-// 2.2.3. Checkpoint reading
 void read_checkpoint(char *checkpoint, Config *config, Qwen3Weights* weights, float** data, ssize_t* file_size, int ctx_length) {
     // Open file and get size
     FILE *file = fopen(checkpoint, "rb");
@@ -274,16 +272,14 @@ void read_checkpoint(char *checkpoint, Config *config, Qwen3Weights* weights, fl
     if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(1); }
     fclose(file);// File can be closed after mapping
 
-    // checkpoint format is 256-byte header, and then the model weights
-
-    // Read configuration information
+    // checkpoint format is header, and then the model weights
     memcpy(config, *data, sizeof(Config));
     if (config->magic_number != 0x6E657771) { fprintf(stderr, "File %s is not a qwen3.c checkpoint\n", checkpoint); exit(1); }// Verify file signature
 
     if (ctx_length != 0 && ctx_length <= config->seq_len)
         config->seq_len = ctx_length;
 
-    printf("hidden_size=%d, intermediate_size=%d, num_hidden_layers=%d, num_attention_heads=%d, num_kv_heads=%d, head_dim=%d, ctx_length=%d, vocab_size=%d, shared_classifier=%d, quantization_block_size=%d\n", config->dim, config->hidden_dim, config->n_layers, config->n_heads, config->n_kv_heads, config->head_dim, config->seq_len, config->vocab_size, config->shared_classifier, config->qgroup_size);
+    printf("hidden_size=%d, intermediate_size=%d, num_hidden_layers=%d, num_attention_heads=%d, num_kv_heads=%d, head_dim=%d, ctx_length=%d, vocab_size=%d, shared_classifier=%d, quantization_block_size=%d\n\n", config->dim, config->hidden_dim, config->n_layers, config->n_heads, config->n_kv_heads, config->head_dim, config->seq_len, config->vocab_size, config->shared_classifier, config->qgroup_size);
 
 
     // Map weights
@@ -380,16 +376,7 @@ void matmul(float *xout, Int8Tensor *x, Int8Tensor *w, int n, int d, Config *con
     }
 }
 
-// Self-added: KV cache optimization
-// Dynamically adjust KV cache size, support generation beyond seq_len
-void resize_kv_cache(RunState* s, Config* p, int new_size) {
-    s->key_cache = realloc(s->key_cache, p->n_layers * new_size * p->dim * sizeof(float));
-    s->value_cache = realloc(s->value_cache, p->n_layers * new_size * p->dim * sizeof(float));
-}
-
-// 6.4. Forward propagation function
 float *forward(Transformer *transformer, int token, int pos) {
-    // Initialize variables and cache references
     Config *p = &transformer->config;
     Qwen3Weights* w = &transformer->weights;
     RunState* s = &transformer->state;
@@ -404,7 +391,6 @@ float *forward(Transformer *transformer, int token, int pos) {
     // copy the token embedding into x - load current token's word embedding vector
     memcpy(x, w->token_embedding_table + token*dim, dim * sizeof(float));
 
-    // ********************************** Core loop ********************************* Attention mechanism implementation: Rotary Position Encoding (RoPE) + Multi-head attention
     // forward all the layers - layer-by-layer computation
     for(int l = 0; l < p->n_layers; l++) {
         // Set KV cache pointers
@@ -627,7 +613,6 @@ int str_lookup(char *str, char **vocab, int vocab_size) {
     return -1;
 }
 
-// 4.5. Tokenizer core functionality 2
 // Encoding: Convert text string to token sequence, implement BPE encoding algorithm
 // BPE algorithm: Determine token merge order through merge scores, balance vocabulary size and semantic expression
 // Special token handling: Support special tokens like system prompts, end tokens, etc.
@@ -880,7 +865,7 @@ int sample(Sampler *sampler, float *logits) {
         // apply softmax to the logits to get the probabilities for next token - apply softmax to convert to probability distribution
         softmax(logits, sampler->vocab_size);// Temperature scaling
 
-        // flip a (float) coin (this is our source of entropy for sampling) - random number generation
+        // flip a (float) coin (this is our source of entropy for sampling)
         float coin = xorshift_f32(&sampler->rng_state);
 
         // we sample from this distribution to get the next token - select sampling strategy based on topp parameter
@@ -888,7 +873,7 @@ int sample(Sampler *sampler, float *logits) {
             next = sample_mult(logits, sampler->vocab_size, coin);// Multinomial sampling
         }
         else {
-            //clamping the least likely tokens to zero
+            // clamp the least likely tokens to zero
             next = sample_topp(logits, sampler->vocab_size, sampler->top_p, sampler->probindex, coin);// top-p sampling
         }
     }
@@ -901,10 +886,10 @@ typedef struct {
 } PromptTemplate;
 
 void render_prompt_template(PromptTemplate* prompt_template, char* system_prompt, char* user_prompt, char* output) {
-    assert(prompt_template != NULL);
-    assert(user_prompt != NULL);
-    assert(output != NULL);
-    assert((!prompt_template->uses_system && system_prompt == NULL) || (prompt_template->uses_system && system_prompt != NULL));
+    ub_assert(prompt_template != NULL);
+    ub_assert(user_prompt != NULL);
+    ub_assert(output != NULL);
+    ub_assert((!prompt_template->uses_system && system_prompt == NULL) || (prompt_template->uses_system && system_prompt != NULL));
     if (prompt_template->uses_system && system_prompt) {
         sprintf(output, prompt_template->template, system_prompt, user_prompt);
     } else {
@@ -948,8 +933,8 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
         // When generated token is BOS (beginning of sequence) or EOS (end of sequence), terminate generation
         if (pos >= num_prompt_tokens && (next == tokenizer->bos_token_id || next == tokenizer->eos_token_id)) { break; }
 
-        printf("%s", decode(tokenizer, token));// Use decode function to convert current token to string, output decoded token
-        fflush(stdout);// Ensure real-time output
+        printf("%s", tokenizer->vocab[token]); // To convert a token to string, just do the lookup
+        fflush(stdout);
         token = next;// Update current token to predicted next token
     }
     printf("\n");
@@ -1028,7 +1013,7 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, Prom
 
         // Output assistant reply (decode token to string)
         if (user_idx >= num_prompt_tokens && next_token != tokenizer->bos_token_id && next_token != tokenizer->eos_token_id) {
-            printf("%s", decode(tokenizer, next_token));
+            printf("%s", tokenizer->vocab[next_token]); // To convert a token to string, just do the lookup
             fflush(stdout);
         }
         if (user_idx >= num_prompt_tokens && (next_token == tokenizer->bos_token_id || next_token == tokenizer->eos_token_id)) { printf("\n"); }
