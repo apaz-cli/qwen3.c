@@ -35,8 +35,21 @@ typedef struct {
 } Int8Tensor;
 
 typedef struct {
+    // attention weights for this layer
+    Int8Tensor wq; // (dim, n_heads * head_size)
+    Int8Tensor wk; // (dim, n_kv_heads * head_size)
+    Int8Tensor wv; // (dim, n_kv_heads * head_size)
+    Int8Tensor wo; // (n_heads * head_size, dim)
+
+    // FFN weights for this layer
+    Int8Tensor w1; // (hidden_dim, dim)
+    Int8Tensor w2; // (dim, hidden_dim)
+    Int8Tensor w3; // (hidden_dim, dim)
+} Qwen3Layer;
+
+typedef struct {
     // token embedding table - model's basic mapping for input tokens
-    Int8Tensor *q_embedding_table; // (vocab_size, dim) - token embedding table (quantized)
+    Int8Tensor q_embedding_table; // (vocab_size, dim) - token embedding table (quantized)
     float *token_embedding_table; // same, but dequantized - token embedding table (dequantized)
 
     // RMSNorm weights
@@ -44,23 +57,14 @@ typedef struct {
     float *rms_ffn_weight; // (layer, dim)
     float *rms_final_weight; // (dim,)
 
-    // Weights for attention matmuls.
-    // Note dim == n_heads * head_size - attention weight matrices (QKV and output matrices) under multi-query attention q, k, v head counts can differ
-    Int8Tensor *wq; // (layer, dim, n_heads * head_size)
-    Int8Tensor *wk; // (layer, dim, n_kv_heads * head_size)
-    Int8Tensor *wv; // (layer, dim, n_kv_heads * head_size)
-    Int8Tensor *wo; // (layer, n_heads * head_size, dim)
+    // Layer weights - now organized by layer for better memory locality
+    Qwen3Layer *layers; // array of layer structs
 
     // Qwen-specific QK-RMSNorm weights
     float *q_ln_weights;
     float *k_ln_weights;
 
-    // weights for ffn - FFN weight matrices, key support for SwiGLU structure
-    Int8Tensor *w1; // (layer, hidden_dim, dim)
-    Int8Tensor *w2; // (layer, dim, hidden_dim)
-    Int8Tensor *w3; // (layer, hidden_dim, dim)
-
-    Int8Tensor *wcls; // (optional) classifier weights for the logits (optionally shared with token embedding)
+    Int8Tensor wcls; // (optional) classifier weights for the logits (optionally shared with token embedding)
 } Qwen3Weights;
 
 // 1.3. Runtime state and cache
@@ -99,10 +103,9 @@ typedef struct {
     Config config; // the hyperparameters of the architecture (the blueprint) - hyperparameter blueprint
     Qwen3Weights weights; // model weights
     RunState state; // buffers for the "wave" of activations in the forward pass - inference runtime state
-
-    // Memory mapping advantages - Large model weight files are big, using mmap to map to memory avoids loading everything into memory, allows inference to run on machines with limited memory
-    float *data; // memory-mapped data pointer - efficiently loads large model weights
-    ssize_t file_size; // model file size - assists memory mapping management
+    
+    float *data;
+    ssize_t file_size;
 } Transformer;
 
 void malloc_run_state(RunState* s, Config *p) {
@@ -199,22 +202,15 @@ void quantize(Int8Tensor *qx, float *x, int n, Config *config) {
 
 // 2.2.1. Quantized tensor initialization
 // Zero-copy design: directly map memory blocks to QuantizedTensor structure. Avoid data copying, improve loading speed
-/* initialize `n` x quantized tensor (with `size_each` elements), starting from memory pointed at *ptr */
-Int8Tensor *init_quantized_tensors(void **ptr, int n, int size_each, Config *config) {
+/* initialize quantized tensor (with `size` elements), starting from memory pointed at *ptr */
+void init_quantized_tensor(void **ptr, Int8Tensor *tensor, int size, Config *config) {
     int QGS = config->qgroup_size;
     void *p = *ptr;
-    Int8Tensor *res = malloc(n * sizeof(Int8Tensor));
-
-    for (int i = 0; i < n; i++) {
-        // map quantized int8 values
-        res[i].q = (int8_t*)p;
-        p = (int8_t*)p + size_each;
-        // Map scaling factors
-        res[i].s = (float*)p;
-        p = (float*)p + size_each / QGS;
-    }
-    *ptr = p; // Update pointer position
-    return res;
+    tensor->q = (int8_t*)p;
+    p = (int8_t*)p + size;
+    tensor->s = (float*)p;
+    p = (float*)p + size / QGS;
+    *ptr = p;
 }
 
 void mmap_weights(Qwen3Weights *w, Config *p, void *ptr) {
@@ -232,25 +228,35 @@ void mmap_weights(Qwen3Weights *w, Config *p, void *ptr) {
     w->k_ln_weights = fptr;
     fptr += p->n_layers * p->head_dim;
 
-    // now read all the quantized weights - load quantized weights (through init_quantized_tensors function)
+    // now read all the quantized weights - load quantized weights
     ptr = (void *)fptr; // now cast the pointer back to void*
-    w->q_embedding_table = init_quantized_tensors(&ptr, 1, p->vocab_size * p->dim, p);
 
-    // dequantize token embedding table - special handling: token embedding table needs dequantization
+    // Load token embedding table
+    init_quantized_tensor(&ptr, &w->q_embedding_table, p->vocab_size * p->dim, p);
+
     w->token_embedding_table = malloc(p->vocab_size * p->dim * sizeof(float));
-    dequantize(w->q_embedding_table, w->token_embedding_table, p->vocab_size * p->dim, p);
+    dequantize(&w->q_embedding_table, w->token_embedding_table, p->vocab_size * p->dim, p);
 
-    // Load attention layer and FFN layer quantized weights
-    w->wq = init_quantized_tensors(&ptr, p->n_layers, p->dim * (p->n_heads * p->head_dim), p);
-    w->wk = init_quantized_tensors(&ptr, p->n_layers, p->dim * (p->n_kv_heads * p->head_dim), p);
-    w->wv = init_quantized_tensors(&ptr, p->n_layers, p->dim * (p->n_kv_heads * p->head_dim), p);
-    w->wo = init_quantized_tensors(&ptr, p->n_layers, (p->n_heads * p->head_dim) * p->dim, p);
+    // Allocate layer array
+    w->layers = malloc(p->n_layers * sizeof(Qwen3Layer));
 
-    w->w1 = init_quantized_tensors(&ptr, p->n_layers, p->dim * p->hidden_dim, p);
-    w->w2 = init_quantized_tensors(&ptr, p->n_layers, p->hidden_dim * p->dim, p);
-    w->w3 = init_quantized_tensors(&ptr, p->n_layers, p->dim * p->hidden_dim, p);
+    // Load layer weights sequentially (better memory locality)
+    for (int l = 0; l < p->n_layers; l++) {
+        init_quantized_tensor(&ptr, &w->layers[l].wq, p->dim * p->n_heads * p->head_dim, p);
+        init_quantized_tensor(&ptr, &w->layers[l].wk, p->dim * p->n_kv_heads * p->head_dim, p);
+        init_quantized_tensor(&ptr, &w->layers[l].wv, p->dim * p->n_kv_heads * p->head_dim, p);
+        init_quantized_tensor(&ptr, &w->layers[l].wo, p->dim * p->n_heads * p->head_dim, p);
+        init_quantized_tensor(&ptr, &w->layers[l].w1, p->dim * p->hidden_dim, p);
+        init_quantized_tensor(&ptr, &w->layers[l].w2, p->dim * p->hidden_dim, p);
+        init_quantized_tensor(&ptr, &w->layers[l].w3, p->dim * p->hidden_dim, p);
+    }
 
-    w->wcls = p->shared_classifier ? w->q_embedding_table : init_quantized_tensors(&ptr, 1, p->dim * p->vocab_size, p);
+    // Load classifier weights
+    if (p->shared_classifier) {
+        w->wcls = w->q_embedding_table;
+    } else {
+        init_quantized_tensor(&ptr, &w->wcls, p->dim * p->vocab_size, p);
+    }
 }
 
 void read_checkpoint(char *checkpoint, Config *config, Qwen3Weights* weights, float** data, ssize_t* file_size, int ctx_length) {
@@ -300,16 +306,8 @@ void build_transformer(Transformer *t, char *checkpoint_path, int ctx_length) {
 }
 
 void free_transformer(Transformer *t) {
-    free(t->weights.q_embedding_table);
     free(t->weights.token_embedding_table);
-    free(t->weights.wq);
-    free(t->weights.wk);
-    free(t->weights.wv);
-    free(t->weights.wo);
-    free(t->weights.w1);
-    free(t->weights.w2);
-    free(t->weights.w3);
-    if(t->weights.wcls != t->weights.q_embedding_table) { free(t->weights.wcls); }
+    free(t->weights.layers);
 
     // close the memory mapping - unmap memory (avoid dangling pointers)
     if (t->data != MAP_FAILED) { munmap(t->data, t->file_size); }
@@ -405,9 +403,9 @@ float *forward(Transformer *transformer, int token, int pos) {
         // Calculate QKV vectors - quantized matrix multiplication (core performance bottleneck)
         // Matrix multiplication optimization: matmul function uses OpenMP parallel computation, optimizes memory access by groups
         quantize(&s->xq, s->xb, dim, p);
-        matmul(s->q, &s->xq, w->wq + l, dim, all_heads_dim, p);// Query matrix
-        matmul(s->k, &s->xq, w->wk + l, dim, kv_dim, p);       // Key matrix
-        matmul(s->v, &s->xq, w->wv + l, dim, kv_dim, p);       // Value matrix
+        matmul(s->q, &s->xq, &w->layers[l].wq, dim, all_heads_dim, p);// Query matrix
+        matmul(s->k, &s->xq, &w->layers[l].wk, dim, kv_dim, p);       // Key matrix
+        matmul(s->v, &s->xq, &w->layers[l].wv, dim, kv_dim, p);       // Value matrix
 
         float *gq = w->q_ln_weights + l * p->head_dim;   // 128 floats
         float *gk = w->k_ln_weights + l * p->head_dim;   // 128 floats
@@ -494,7 +492,7 @@ float *forward(Transformer *transformer, int token, int pos) {
 
         // final matmul to get the output of the attention - attention output linear transformation
         quantize(&s->xq, s->xb, all_heads_dim, p);
-        matmul(s->xb2, &s->xq, w->wo + l, all_heads_dim, dim, p);
+        matmul(s->xb2, &s->xq, &w->layers[l].wo, all_heads_dim, dim, p);
 
         // residual connection back into x
         for (int i = 0; i < dim; i++) {
@@ -508,8 +506,8 @@ float *forward(Transformer *transformer, int token, int pos) {
         // first calculate self.w1(x) and self.w3(x)
         quantize(&s->xq, s->xb, dim, p);
         // Calculate two linear transformations of FFN: w1(x) and w3(x)
-        matmul(s->hb, &s->xq, w->w1 + l, dim, hidden_dim, p);
-        matmul(s->hb2, &s->xq, w->w3 + l, dim, hidden_dim, p);
+        matmul(s->hb, &s->xq, &w->layers[l].w1, dim, hidden_dim, p);
+        matmul(s->hb2, &s->xq, &w->layers[l].w3, dim, hidden_dim, p);
 
         // SwiGLU non-linearity - FFN layer computation (SwiGLU activation)
         // SwiGLU activation function: f(x) = silu(w1(x)) * w3(x), compared to ReLU, improves model expressiveness while maintaining computational efficiency
@@ -525,7 +523,7 @@ float *forward(Transformer *transformer, int token, int pos) {
 
         // final matmul to get the output of the ffn - FFN output linear transformation
         quantize(&s->hq, s->hb, hidden_dim, p);
-        matmul(s->xb, &s->hq, w->w2 + l, hidden_dim, dim, p);// Final projection
+        matmul(s->xb, &s->hq, &w->layers[l].w2, hidden_dim, dim, p);// Final projection
 
         // residual connection
         for (int i = 0; i < dim; i++) {
@@ -538,7 +536,7 @@ float *forward(Transformer *transformer, int token, int pos) {
 
     // classifier into logits - final classifier
     quantize(&s->xq, x, dim, p);
-    matmul(s->logits, &s->xq, w->wcls, dim, p->vocab_size, p);
+    matmul(s->logits, &s->xq, &w->wcls, dim, p->vocab_size, p);
 
     return s->logits;
 }
@@ -569,7 +567,7 @@ void build_tokenizer(Tokenizer *t, char *checkpoint_path, int vocab_size, int en
         exit(1);
     }
 
-    // Read tokenizer metadata
+    // Read metadata
     fread(&t->max_token_length, sizeof(int), 1, file);
     fread(&t->bos_token_id, sizeof(int), 1, file);
     fread(&t->eos_token_id, sizeof(int), 1, file);

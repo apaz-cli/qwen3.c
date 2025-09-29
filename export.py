@@ -71,7 +71,8 @@ def model_export(model, filepath, group_size=64):
     while model.params.dim % group_size != 0:
         group_size //= 2
         print(f"BACKOFF: reducing group size to {group_size} to fit hidden_dim")
-    weights = [
+    # Collect weights for validation but export sequentially by layer
+    all_weights = [
         model.tok_embeddings.weight,
         *[layer.attention.wq.weight for layer in model.layers],
         *[layer.attention.wk.weight for layer in model.layers],
@@ -84,19 +85,18 @@ def model_export(model, filepath, group_size=64):
     has_shared_classifier = torch.equal(model.tok_embeddings.weight, model.output.weight)
 
     if not has_shared_classifier:
-        weights.append(model.output.weight)
-    for i, w in enumerate(weights):
+        all_weights.append(model.output.weight)
+    for i, embeddings_weight in enumerate(all_weights):
         assert (
-            w.numel() % group_size == 0
-        ), f"weight {i} has numel {w.numel()}, not a multiple of group_size {group_size}"
+            embeddings_weight.numel() % group_size == 0
+        ), f"weight {i} has numel {embeddings_weight.numel()}, not a multiple of group_size {group_size}"
 
     # write
     out_file = open(filepath, "wb")
     # first write out the header. the header will be 256 bytes
-    # 1) write magic, which will be uint32 of "qwen" in ASCII
-    import codecs
+    # write magic, which will be uint32 of "qwen" in ASCII
     out_file.write(struct.pack("I", 0x6E657771))
-    # 3) write the params, which will be 7 ints
+    # write the params
     p = model.params
     hidden_dim = model.layers[0].feed_forward.w1.weight.shape[0]
     n_kv_heads = p.n_heads if p.n_kv_heads is None else p.n_kv_heads
@@ -136,19 +136,48 @@ def model_export(model, filepath, group_size=64):
         serialize_fp32(out_file, layer.attention.lk.weight)
 
     # now let's write out all the params that we are quantizing to Q8_0
-    # note we skip classifier weights, which are shared with the embedding
+    # Export weights sequentially by layer for better memory locality
     ew = []
-    for i, w in enumerate(weights):
-        # quantize this weight
-        q, s, err = quantize_q80(w, group_size)
-        # save the int8 weights to file
-        serialize_int8(out_file, q)  # save the tensor in int8
-        serialize_fp32(out_file, s)  # save scale factors
-        # logging
-        ew.append((err, w.shape))
-        print(
-            f"{i+1}/{len(weights)} quantized {tuple(w.shape)} to Q8_0 with max error {err:.8f}"
-        )
+    weight_count = 0
+
+    # First, export token embeddings
+    embeddings_weight = model.tok_embeddings.weight
+    q, s, err = quantize_q80(embeddings_weight, group_size)
+    serialize_int8(out_file, q)
+    serialize_fp32(out_file, s)
+    ew.append((err, embeddings_weight.shape))
+    weight_count += 1
+    print(f"{weight_count}/{len(all_weights)} quantized token_embeddings {tuple(embeddings_weight.shape)} to Q8_0 with max error {err:.8f}")
+
+    # Then, export layer weights sequentially
+    for layer_idx, layer in enumerate(model.layers):
+        layer_weights = [
+            ("wq", layer.attention.wq.weight),
+            ("wk", layer.attention.wk.weight),
+            ("wv", layer.attention.wv.weight),
+            ("wo", layer.attention.wo.weight),
+            ("w1", layer.feed_forward.w1.weight),
+            ("w2", layer.feed_forward.w2.weight),
+            ("w3", layer.feed_forward.w3.weight),
+        ]
+
+        for weight_name, embeddings_weight in layer_weights:
+            q, s, err = quantize_q80(embeddings_weight, group_size)
+            serialize_int8(out_file, q)
+            serialize_fp32(out_file, s)
+            ew.append((err, embeddings_weight.shape))
+            weight_count += 1
+            print(f"{weight_count}/{len(all_weights)} quantized layer_{layer_idx}.{weight_name} {tuple(embeddings_weight.shape)} to Q8_0 with max error {err:.8f}")
+
+    # Finally, export classifier weights if not shared
+    if not has_shared_classifier:
+        embeddings_weight = model.output.weight
+        q, s, err = quantize_q80(embeddings_weight, group_size)
+        serialize_int8(out_file, q)
+        serialize_fp32(out_file, s)
+        ew.append((err, embeddings_weight.shape))
+        weight_count += 1
+        print(f"{weight_count}/{len(all_weights)} quantized output {tuple(embeddings_weight.shape)} to Q8_0 with max error {err:.8f}")
 
     # print the highest error across all weights, should be very small, e.g. O(~0.001)
     ew.sort(reverse=True)
