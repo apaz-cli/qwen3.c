@@ -120,22 +120,6 @@ def model_export(model, filepath, group_size=64):
     out_file.write(b"\0" * pad)
     # now that the header is done, let's write out the model
 
-    # first let's write out all the params that we are keeping in fp32: the norms
-    for layer in model.layers:  # attention norms
-        serialize_fp32(out_file, layer.attention_norm.weight)
-    for layer in model.layers:  # MLP norms
-        serialize_fp32(out_file, layer.ffn_norm.weight)
-    serialize_fp32(out_file, model.norm.weight)  # final pre-classifier norm
-
-    # write out the QK-LayerNorm weights (Qwen3)
-    for layer in model.layers:
-        assert layer.attention.lq.weight is not None
-        serialize_fp32(out_file, layer.attention.lq.weight)
-    for layer in model.layers:
-        assert layer.attention.lk.weight is not None
-        serialize_fp32(out_file, layer.attention.lk.weight)
-
-    # now let's write out all the params that we are quantizing to Q8_0
     # Export weights sequentially by layer for better memory locality
     ew = []
     weight_count = 0
@@ -149,25 +133,39 @@ def model_export(model, filepath, group_size=64):
     weight_count += 1
     print(f"{weight_count}/{len(all_weights)} quantized token_embeddings {tuple(embeddings_weight.shape)} to Q8_0 with max error {err:.8f}")
 
-    # Then, export layer weights sequentially
+    # Then, export each layer with all its data together (norms + weights)
     for layer_idx, layer in enumerate(model.layers):
+        assert layer.attention.lq.weight is not None
+        assert layer.attention.lk.weight is not None
+
         layer_weights = [
-            ("wq", layer.attention.wq.weight),
-            ("wk", layer.attention.wk.weight),
-            ("wv", layer.attention.wv.weight),
-            ("wo", layer.attention.wo.weight),
-            ("w1", layer.feed_forward.w1.weight),
-            ("w2", layer.feed_forward.w2.weight),
-            ("w3", layer.feed_forward.w3.weight),
+            ("rms_att", layer.attention_norm.weight, False),  # (name, weight, quantize)
+            ("rms_ffn", layer.ffn_norm.weight, False),
+            ("q_ln", layer.attention.lq.weight, False),
+            ("k_ln", layer.attention.lk.weight, False),
+            ("wq", layer.attention.wq.weight, True),
+            ("wk", layer.attention.wk.weight, True),
+            ("wv", layer.attention.wv.weight, True),
+            ("wo", layer.attention.wo.weight, True),
+            ("w1", layer.feed_forward.w1.weight, True),
+            ("w2", layer.feed_forward.w2.weight, True),
+            ("w3", layer.feed_forward.w3.weight, True),
         ]
 
-        for weight_name, embeddings_weight in layer_weights:
-            q, s, err = quantize_q80(embeddings_weight, group_size)
-            serialize_int8(out_file, q)
-            serialize_fp32(out_file, s)
-            ew.append((err, embeddings_weight.shape))
-            weight_count += 1
-            print(f"{weight_count}/{len(all_weights)} quantized layer_{layer_idx}.{weight_name} {tuple(embeddings_weight.shape)} to Q8_0 with max error {err:.8f}")
+        for weight_name, weight, quantize in layer_weights:
+            if quantize:
+                q, s, err = quantize_q80(weight, group_size)
+                serialize_int8(out_file, q)
+                serialize_fp32(out_file, s)
+                ew.append((err, weight.shape))
+                weight_count += 1
+                print(f"{weight_count}/{len(all_weights)} wrote layer_{layer_idx}.{weight_name} {tuple(weight.shape)} as Q8_0 with max error {err:.8f}")
+            else:
+                serialize_fp32(out_file, weight)
+                print(f"{weight_count+1}/{len(all_weights)} wrote layer_{layer_idx}.{weight_name} {tuple(weight.shape)} as fp32")
+
+    # Write final norm after all layers
+    serialize_fp32(out_file, model.norm.weight)
 
     # Finally, export classifier weights if not shared
     if not has_shared_classifier:
@@ -178,6 +176,8 @@ def model_export(model, filepath, group_size=64):
         ew.append((err, embeddings_weight.shape))
         weight_count += 1
         print(f"{weight_count}/{len(all_weights)} quantized output {tuple(embeddings_weight.shape)} to Q8_0 with max error {err:.8f}")
+    else:
+        print("output layer shares weights with token embeddings, not writing.")
 
     # print the highest error across all weights, should be very small, e.g. O(~0.001)
     ew.sort(reverse=True)

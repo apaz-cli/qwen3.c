@@ -36,11 +36,19 @@ typedef struct {
 } Int8Tensor;
 
 typedef struct {
+    // RMSNorm weights for this layer
+    float *rms_att_weight; // (dim,)
+    float *rms_ffn_weight; // (dim,)
+
     // attention weights for this layer
     Int8Tensor wq; // (dim, n_heads * head_size)
     Int8Tensor wk; // (dim, n_kv_heads * head_size)
     Int8Tensor wv; // (dim, n_kv_heads * head_size)
     Int8Tensor wo; // (n_heads * head_size, dim)
+
+    // Qwen-specific QK-RMSNorm weights
+    float *q_ln_weight; // (head_dim,)
+    float *k_ln_weight; // (head_dim,)
 
     // FFN weights for this layer
     Int8Tensor w1; // (hidden_dim, dim)
@@ -53,17 +61,11 @@ typedef struct {
     Int8Tensor q_embedding_table; // (vocab_size, dim) - token embedding table (quantized)
     float *token_embedding_table; // same, but dequantized - token embedding table (dequantized)
 
-    // RMSNorm weights
-    float *rms_att_weight; // (layer, dim)
-    float *rms_ffn_weight; // (layer, dim)
-    float *rms_final_weight; // (dim,)
-
     // Layer weights - now organized by layer for better memory locality
     Qwen3Layer *layers; // array of layer structs
 
-    // Qwen-specific QK-RMSNorm weights
-    float *q_ln_weights;
-    float *k_ln_weights;
+    // Final RMSNorm weight
+    float *rms_final_weight; // (dim,)
 
     Int8Tensor wcls; // (optional) classifier weights for the logits (optionally shared with token embedding)
 } Qwen3Weights;
@@ -215,24 +217,7 @@ void init_quantized_tensor(void **ptr, Int8Tensor *tensor, int size, Config *con
 }
 
 void mmap_weights(Qwen3Weights *w, Config *p, void *ptr) {
-    // first are the parameters that are kept in fp32 (the rmsnorm (1D) weights) - load FP32 RMSNorm weights
-    float *fptr = (float*) ptr;
-
-    w->rms_att_weight = fptr;
-    fptr += p->n_layers * p->dim;
-    w->rms_ffn_weight = fptr;
-    fptr += p->n_layers * p->dim;
-    w->rms_final_weight = fptr;
-    fptr += p->dim;
-    w->q_ln_weights = fptr;
-    fptr += p->n_layers * p->head_dim;
-    w->k_ln_weights = fptr;
-    fptr += p->n_layers * p->head_dim;
-
-    // now read all the quantized weights - load quantized weights
-    ptr = (void *)fptr; // now cast the pointer back to void*
-
-    // Load token embedding table
+    // Load token embedding table first
     // Theoretically, the embedding and classifier layer/layers should be left in fp32, but then I would have
     // to implement an fp32 matmul, which would bloat the code. So I will not.
     init_quantized_tensor(&ptr, &w->q_embedding_table, p->vocab_size * p->dim, p);
@@ -243,8 +228,23 @@ void mmap_weights(Qwen3Weights *w, Config *p, void *ptr) {
     // Allocate layer array
     w->layers = malloc(p->n_layers * sizeof(Qwen3Layer));
 
-    // Load layer weights sequentially (better memory locality)
+    // Load each layer with all its data together (norms + weights)
     for (int l = 0; l < p->n_layers; l++) {
+        float *fptr = (float*) ptr;
+
+        // Load fp32 norms for this layer
+        w->layers[l].rms_att_weight = fptr;
+        fptr += p->dim;
+        w->layers[l].rms_ffn_weight = fptr;
+        fptr += p->dim;
+        w->layers[l].q_ln_weight = fptr;
+        fptr += p->head_dim;
+        w->layers[l].k_ln_weight = fptr;
+        fptr += p->head_dim;
+
+        ptr = (void*) fptr;
+
+        // Load quantized weights for this layer
         init_quantized_tensor(&ptr, &w->layers[l].wq, p->dim * p->n_heads * p->head_dim, p);
         init_quantized_tensor(&ptr, &w->layers[l].wk, p->dim * p->n_kv_heads * p->head_dim, p);
         init_quantized_tensor(&ptr, &w->layers[l].wv, p->dim * p->n_kv_heads * p->head_dim, p);
@@ -253,6 +253,12 @@ void mmap_weights(Qwen3Weights *w, Config *p, void *ptr) {
         init_quantized_tensor(&ptr, &w->layers[l].w2, p->dim * p->hidden_dim, p);
         init_quantized_tensor(&ptr, &w->layers[l].w3, p->dim * p->hidden_dim, p);
     }
+
+    // Load final norm after all layers
+    float *fptr = (float*) ptr;
+    w->rms_final_weight = fptr;
+    fptr += p->dim;
+    ptr = (void*) fptr;
 
     // Load classifier weights
     if (p->shared_classifier) {
@@ -396,7 +402,7 @@ float *forward(Transformer *transformer, int token, int pos) {
         s->v = s->value_cache + loff + pos * kv_dim;// Current position's V vector cache location
 
         // Attention layer: RMSNorm normalization
-        rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
+        rmsnorm(s->xb, x, w->layers[l].rms_att_weight, dim);
 
         // Calculate QKV vectors - quantized matrix multiplication (core performance bottleneck)
         // Matrix multiplication optimization: matmul function uses OpenMP parallel computation, optimizes memory access by groups
@@ -405,8 +411,8 @@ float *forward(Transformer *transformer, int token, int pos) {
         matmul(s->k, &s->xq, &w->layers[l].wk, dim, kv_dim, p);       // Key matrix
         matmul(s->v, &s->xq, &w->layers[l].wv, dim, kv_dim, p);       // Value matrix
 
-        float *gq = w->q_ln_weights + l * p->head_dim;   // 128 floats
-        float *gk = w->k_ln_weights + l * p->head_dim;   // 128 floats
+        float *gq = w->layers[l].q_ln_weight;
+        float *gk = w->layers[l].k_ln_weight;
 
         /* ------------ Q-RMSNorm + rotate each query head ------------- */
         // Q-RMSNorm + RoPE rotary position encoding (query heads)
@@ -498,7 +504,7 @@ float *forward(Transformer *transformer, int token, int pos) {
         }
 
         // FFN RMSNorm
-        rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+        rmsnorm(s->xb, x, w->layers[l].rms_ffn_weight, dim);
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
