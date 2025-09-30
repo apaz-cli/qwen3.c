@@ -139,17 +139,18 @@ def model_export(model, filepath, group_size=64):
         assert layer.attention.lk.weight is not None
 
         layer_weights = [
+            # Ordered by access pattern in forward pass for better cache locality
             ("rms_att", layer.attention_norm.weight, False),  # (name, weight, quantize)
-            ("rms_ffn", layer.ffn_norm.weight, False),
-            ("q_ln", layer.attention.lq.weight, False),
-            ("k_ln", layer.attention.lk.weight, False),
             ("wq", layer.attention.wq.weight, True),
             ("wk", layer.attention.wk.weight, True),
             ("wv", layer.attention.wv.weight, True),
+            ("q_ln", layer.attention.lq.weight, False),
+            ("k_ln", layer.attention.lk.weight, False),
             ("wo", layer.attention.wo.weight, True),
+            ("rms_ffn", layer.ffn_norm.weight, False),
             ("w1", layer.feed_forward.w1.weight, True),
-            ("w2", layer.feed_forward.w2.weight, True),
             ("w3", layer.feed_forward.w3.weight, True),
+            ("w2", layer.feed_forward.w2.weight, True),
         ]
 
         for weight_name, weight, quantize in layer_weights:

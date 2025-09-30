@@ -36,24 +36,18 @@ typedef struct {
 } Int8Tensor;
 
 typedef struct {
-    // RMSNorm weights for this layer
+    // Weights in access order for better cache locality
     float *rms_att_weight; // (dim,)
-    float *rms_ffn_weight; // (dim,)
-
-    // attention weights for this layer
     Int8Tensor wq; // (dim, n_heads * head_size)
     Int8Tensor wk; // (dim, n_kv_heads * head_size)
     Int8Tensor wv; // (dim, n_kv_heads * head_size)
-    Int8Tensor wo; // (n_heads * head_size, dim)
-
-    // Qwen-specific QK-RMSNorm weights
     float *q_ln_weight; // (head_dim,)
     float *k_ln_weight; // (head_dim,)
-
-    // FFN weights for this layer
+    Int8Tensor wo; // (n_heads * head_size, dim)
+    float *rms_ffn_weight; // (dim,)
     Int8Tensor w1; // (hidden_dim, dim)
-    Int8Tensor w2; // (dim, hidden_dim)
     Int8Tensor w3; // (hidden_dim, dim)
+    Int8Tensor w2; // (dim, hidden_dim)
 } Qwen3Layer;
 
 typedef struct {
@@ -228,30 +222,41 @@ void mmap_weights(Qwen3Weights *w, Config *p, void *ptr) {
     // Allocate layer array
     w->layers = malloc(p->n_layers * sizeof(Qwen3Layer));
 
-    // Load each layer with all its data together (norms + weights)
+    // Load each layer with all its data together in access order
     for (int l = 0; l < p->n_layers; l++) {
         float *fptr = (float*) ptr;
 
-        // Load fp32 norms for this layer
+        // rms_att
         w->layers[l].rms_att_weight = fptr;
         fptr += p->dim;
-        w->layers[l].rms_ffn_weight = fptr;
-        fptr += p->dim;
+        ptr = (void*) fptr;
+
+        // wq, wk, wv
+        init_quantized_tensor(&ptr, &w->layers[l].wq, p->dim * p->n_heads * p->head_dim, p);
+        init_quantized_tensor(&ptr, &w->layers[l].wk, p->dim * p->n_kv_heads * p->head_dim, p);
+        init_quantized_tensor(&ptr, &w->layers[l].wv, p->dim * p->n_kv_heads * p->head_dim, p);
+
+        fptr = (float*) ptr;
+        // q_ln, k_ln
         w->layers[l].q_ln_weight = fptr;
         fptr += p->head_dim;
         w->layers[l].k_ln_weight = fptr;
         fptr += p->head_dim;
-
         ptr = (void*) fptr;
 
-        // Load quantized weights for this layer
-        init_quantized_tensor(&ptr, &w->layers[l].wq, p->dim * p->n_heads * p->head_dim, p);
-        init_quantized_tensor(&ptr, &w->layers[l].wk, p->dim * p->n_kv_heads * p->head_dim, p);
-        init_quantized_tensor(&ptr, &w->layers[l].wv, p->dim * p->n_kv_heads * p->head_dim, p);
+        // wo
         init_quantized_tensor(&ptr, &w->layers[l].wo, p->dim * p->n_heads * p->head_dim, p);
+
+        fptr = (float*) ptr;
+        // rms_ffn
+        w->layers[l].rms_ffn_weight = fptr;
+        fptr += p->dim;
+        ptr = (void*) fptr;
+
+        // w1, w3, w2
         init_quantized_tensor(&ptr, &w->layers[l].w1, p->dim * p->hidden_dim, p);
-        init_quantized_tensor(&ptr, &w->layers[l].w2, p->dim * p->hidden_dim, p);
         init_quantized_tensor(&ptr, &w->layers[l].w3, p->dim * p->hidden_dim, p);
+        init_quantized_tensor(&ptr, &w->layers[l].w2, p->dim * p->hidden_dim, p);
     }
 
     // Load final norm after all layers
